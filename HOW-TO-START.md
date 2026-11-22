@@ -2,7 +2,8 @@
 
 ## Download a ready-made build
 Each [GitHub release](https://github.com/Simsen/ThinkCraft/releases) has:
-- `thinkcraft-windows-x64.zip`: unzip it and double-click **ThinkCraft.exe**.
+- `thinkcraft-windows-x64.zip`: most Windows PCs. Unzip it and double-click **ThinkCraft.exe**.
+- `thinkcraft-windows-arm64.zip`: ARM Windows PCs (Snapdragon laptops, Windows in Parallels on an Apple Silicon Mac).
 - `thinkcraft-macos-arm64.zip`: unzip it and drag **ThinkCraft.app** into Applications.
 
 Builds of the latest code are also under [Actions](https://github.com/Simsen/ThinkCraft/actions) → the newest **Build** run → *Artifacts* (you need to be signed in to GitHub).
@@ -10,6 +11,11 @@ Builds of the latest code are also under [Actions](https://github.com/Simsen/Thi
 The builds aren't signed with a paid certificate yet, so the first time you start one:
 - **Windows:** if SmartScreen says "Windows protected your PC", click **More info** → **Run anyway**.
 - **macOS:** right-click the app and choose **Open** once.
+
+## If it doesn't start
+ThinkCraft shows a message saying what went wrong and saves it in `error.log` next to
+your autosaved work (see the end of this page). Please include that text when you
+[report the problem](https://github.com/Simsen/ThinkCraft/issues).
 
 ## Windows: build it yourself
 1. Install Rust from [rustup.rs](https://rustup.rs). When asked, let it install the Visual Studio C++ build tools.

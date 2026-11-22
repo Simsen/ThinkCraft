@@ -18,11 +18,13 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x64
+          - os: windows-11-arm
+            name: windows-arm64
           - os: macos-latest
             name: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -33,6 +35,20 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      - name: Start check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Start the real app, let it draw and save a picture, then close.
+          # Fails if the window can't open.
+          $p = Start-Process target/release/thinkcraft.exe -ArgumentList '--screenshot', "$env:RUNNER_TEMP\start.png" -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "ThinkCraft didn't finish starting within 90 seconds" }
+          if (-not (Test-Path "$env:RUNNER_TEMP\start.png")) {
+            Get-Content "$env:APPDATA\ThinkCraft\error.log" -ErrorAction SilentlyContinue
+            throw "ThinkCraft didn't open its window (exit code $($p.ExitCode))"
+          }
+          Write-Host "ThinkCraft started and drew its window."
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -50,7 +66,7 @@ jobs:
           cp README.md LICENSE-MIT LICENSE-APACHE dist/
           cd dist && ditto -c -k --keepParent ThinkCraft.app ../thinkcraft-${{ matrix.name }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: thinkcraft-${{ matrix.name }}
           path: thinkcraft-${{ matrix.name }}.zip

@@ -112,9 +112,53 @@ fn main() -> eframe::Result {
     }
     options.viewport = viewport;
 
-    eframe::run_native(
+    #[cfg(target_os = "windows")]
+    {
+        options.renderer = eframe::Renderer::Wgpu;
+    }
+
+    std::panic::set_hook(Box::new(|info| report_failure(&format!("ThinkCraft stopped unexpectedly.\n\n{info}"))));
+
+    let result = eframe::run_native(
         "ThinkCraft",
         options,
         Box::new(move |cc| Ok(Box::new(app::ThinkCraft::new(cc, app::Cli { screenshot, open: open_file, export_pptx, export_xlsx })))),
-    )
+    );
+    if let Err(e) = &result {
+        report_failure(&format!("ThinkCraft couldn't start.\n\n{e}"));
+    }
+    result
+}
+
+/// Make a failure visible. Release builds on Windows have no console, so without this
+/// the app would just not appear. The message is printed, written to a log file and,
+/// on Windows, shown in a dialog.
+fn report_failure(message: &str) {
+    eprintln!("{message}");
+    let dir = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("ThinkCraft"))
+    } else {
+        std::env::var_os("HOME").map(|d| std::path::PathBuf::from(d).join("Library/Application Support/ThinkCraft"))
+    };
+    let log = dir.and_then(|d| {
+        std::fs::create_dir_all(&d).ok()?;
+        let f = d.join("error.log");
+        std::fs::write(&f, message).ok()?;
+        Some(f)
+    });
+    #[cfg(target_os = "windows")]
+    {
+        let mut text = message.to_string();
+        if let Some(f) = &log {
+            text.push_str(&format!("\n\nThis message is also saved in {}", f.display()));
+        }
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("ThinkCraft")
+            .set_description(text)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = log;
 }

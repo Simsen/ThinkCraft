@@ -21,6 +21,12 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 calamine = "0.38"
 
+# On Windows, draw with wgpu (DirectX 12, or Vulkan/OpenGL as a fallback) instead of
+# OpenGL alone: plain OpenGL is often missing in virtual machines, over Remote Desktop
+# and on ARM PCs, and the app then can't open its window.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu"] }
+
 [profile.release]
 opt-level = 2
 
