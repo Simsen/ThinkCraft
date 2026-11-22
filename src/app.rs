@@ -66,8 +66,18 @@ const RADIAL: [RadialCmd; 14] = [
 /// The calendar window for a Gantt chart: which chart and which month is shown.
 struct CalendarDlg {
     id: u64,
+    /// The month picked at the top, scrolled into view when `scroll` is set.
     year: i32,
     month: u32,
+    scroll: bool,
+    /// The first day clicked, waiting for the last day (days since 1970).
+    pending: Option<i64>,
+    /// The exact first and last day picked last time.
+    chosen: Option<(i64, i64)>,
+    /// The day under the pointer in the last frame.
+    hover: Option<i64>,
+    /// Just opened: place the window in the middle of the screen.
+    fresh: bool,
 }
 
 /// First line of ThinkCraft's clipboard text, so a paste can tell it from other text.
@@ -291,6 +301,7 @@ fn gantt_hit(el: &Element, xf: &Xf, p: Pos2) -> Option<GanttHit> {
     let edge = 6.0;
     let bars = bars_topmost(g);
     // bar ends first, so short bars can still be stretched
+    let bars: Vec<_> = bars.into_iter().filter(|(_, _, t)| geo.visible(t)).collect();
     for (row, b, t) in &bars {
         if t.milestone {
             continue;
@@ -896,7 +907,9 @@ impl ThinkCraft {
             Action::GanttCalendar { id } => {
                 let start = self.gantt_mut(id).and_then(|g| g.start);
                 match start {
-                    Some([y, m, _]) => self.calendar_dlg = Some(CalendarDlg { id, year: y, month: m.clamp(1, 12) as u32 }),
+                    Some([y, m, _]) => {
+                        self.calendar_dlg = Some(CalendarDlg { id, year: y, month: m.clamp(1, 12) as u32, scroll: true, pending: None, chosen: None, hover: None, fresh: true })
+                    }
                     None => self.status = "The calendar is for timelines in calendar weeks. Switch the chart to Calendar weeks first.".into(),
                 }
             }
@@ -2245,10 +2258,11 @@ impl ThinkCraft {
         self.actions.push(action);
     }
 
-    /// The calendar window: pick the week the timeline starts on; bars keep their dates.
+    /// The calendar window: a year planner with one line per month and the weekdays lined
+    /// up. Click the first day and then the last day of the period the chart should show.
     fn calendar_window(&mut self, ctx: &egui::Context) {
         let Some(dlg) = &self.calendar_dlg else { return };
-        let (id, mut year, mut month) = (dlg.id, dlg.year, dlg.month);
+        let (id, mut year, mut month, mut scroll, pending, chosen, last_hover, fresh) = (dlg.id, dlg.year, dlg.month, dlg.scroll, dlg.pending, dlg.chosen, dlg.hover, dlg.fresh);
         let Some(g) = self.gantt_mut(id) else {
             self.calendar_dlg = None;
             return;
@@ -2258,92 +2272,214 @@ impl ThinkCraft {
             return;
         };
         let start = days_from_civil(sy, sm.max(1) as u32, sd.max(1) as u32);
-        let mut weeks = g.weeks.max(1);
-        let end = start + 7 * weeks as i64 - 1;
+        let weeks = g.weeks.max(1) as i64;
+        // the period shown: the days picked if the chart still matches them, else its whole weeks
+        let period = match chosen {
+            Some((a, b)) if a - weekday(a) as i64 == start && (b - start) / 7 + 1 == weeks => (a, b),
+            _ => (start, start + 7 * weeks - 1),
+        };
         let today = today_days();
+        let date = |d: i64| {
+            let (y, m, dd) = civil_from_days(d);
+            format!("{dd:02}.{m:02}.{y}")
+        };
         let mut open = true;
-        let mut new_start = None;
+        let mut clicked_day = None;
         let mut fit = false;
-        egui::Window::new("Timeline calendar").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("‹").on_hover_text("Previous month").clicked() {
-                    (year, month) = if month == 1 { (year - 1, 12) } else { (year, month - 1) };
-                }
-                ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new(format!("{} {year}", FULL_MONTHS[(month as usize + 11) % 12])).strong()));
-                if ui.button("›").on_hover_text("Next month").clicked() {
-                    (year, month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
-                }
-            });
-            let first = days_from_civil(year, month, 1);
-            let monday = first - weekday(first) as i64;
-            egui::Grid::new("cal").spacing([2.0, 2.0]).show(ui, |ui| {
-                ui.label(RichText::new("Wk").color(Color32::GRAY));
-                for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
-                    ui.add_sized([26.0, 16.0], egui::Label::new(RichText::new(d).color(Color32::GRAY)));
-                }
-                ui.end_row();
-                for w in 0..6 {
-                    let row_start = monday + 7 * w;
-                    ui.label(RichText::new(format!("{:02}", iso_week(row_start).1)).color(Color32::GRAY));
-                    for k in 0..7 {
-                        let day = row_start + k;
-                        let (_, m, dd) = civil_from_days(day);
-                        let inside = day >= start && day <= end;
-                        let first_week = day >= start && day < start + 7;
-                        let fill = if first_week {
-                            ACCENT
-                        } else if inside {
-                            Color32::from_rgb(250, 222, 208)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        let mut txt = RichText::new(dd.to_string());
-                        txt = if first_week {
-                            txt.color(Color32::WHITE)
-                        } else if m != month {
-                            txt.color(Color32::from_gray(170))
-                        } else {
-                            txt
-                        };
-                        if day == today {
-                            txt = txt.underline();
+        let mut hover_day = None;
+        // layout of the planner: month name, then week blocks of a week number and 7 days;
+        // big like a wall planner, shrunk only when the window is too narrow for it
+        let screen = ctx.content_rect();
+        let base = 104.0 + 6.0 * 22.0 + 37.0 * 30.0;
+        // fits small screens, and fills about 70% of a big one
+        let k = ((screen.width() - 70.0) / base).min(1.0).max(screen.width() * 0.7 / base).clamp(0.6, 1.35);
+        let (name_w, wk_w, day_w, row_h) = (104.0 * k, 22.0 * k, 30.0 * k, 25.0 * k);
+        let total_w = name_w + 6.0 * wk_w + 37.0 * day_w;
+        let slot_x = |k: usize| name_w + (k / 7 + 1) as f32 * wk_w + k as f32 * day_w;
+        let (y0, y1) = (sy.min(year) - 1, (civil_from_days(period.1).0).max(year) + 1);
+        let size = Vec2::new(total_w + 30.0, (screen.height() - 120.0).clamp(360.0, 1100.0));
+        let mut window = egui::Window::new("Calendar").collapsible(false).resizable(true).default_size(size).open(&mut open);
+        if fresh {
+            window = window.current_pos(screen.center() - size / 2.0);
+        }
+        window
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let before = (year, month);
+                    egui::ComboBox::from_id_salt("cal_month").width(110.0).selected_text(FULL_MONTHS[(month as usize + 11) % 12]).show_ui(ui, |ui| {
+                        for (i, name) in FULL_MONTHS.iter().enumerate() {
+                            ui.selectable_value(&mut month, i as u32 + 1, *name);
                         }
-                        if ui.add_sized([26.0, 20.0], egui::Button::new(txt).fill(fill)).on_hover_text("Start the timeline in this week").clicked() {
-                            new_start = Some(day);
+                    });
+                    ui.add(egui::DragValue::new(&mut year).range(1990..=2100));
+                    if (year, month) != before {
+                        scroll = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let days = period.1 - period.0 + 1;
+                        let (w, d) = (days / 7, days % 7);
+                        let span = match (w, d) {
+                            (0, d) => format!("{d} day{}", if d == 1 { "" } else { "s" }),
+                            (w, 0) => format!("{w} week{}", if w == 1 { "" } else { "s" }),
+                            (w, d) => format!("{w} week{} {d} day{}", if w == 1 { "" } else { "s" }, if d == 1 { "" } else { "s" }),
+                        };
+                        ui.label(RichText::new(format!("{} to {}, {span}", date(period.0), date(period.1))).size(17.0).strong());
+                    });
+                });
+                let hint = match pending {
+                    Some(p) => format!("First day: {}. Now click the last day of the period.", date(p)),
+                    None => "Click the first day of the period, then the last day. The chart shows the whole calendar weeks they fall in; bars keep their dates.".into(),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(hint).color(if pending.is_some() { ACCENT } else { Color32::from_rgb(90, 92, 100) }));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Fit scale to data").on_hover_text("Show just the weeks that hold bars and milestones").clicked() {
+                            fit = true;
+                        }
+                        if ui.button("Go to today").clicked() {
+                            let (y, m, _) = civil_from_days(today);
+                            (year, month, scroll) = (y, m, true);
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let font = FontId::proportional(16.0 * k);
+                    let small = FontId::proportional(11.0 * k);
+                    for y in y0..=y1 {
+                        // the year line with the weekday letters
+                        let (hr, _) = ui.allocate_exact_size(Vec2::new(total_w, row_h + 2.0), Sense::hover());
+                        let p = ui.painter();
+                        p.rect_filled(hr, 0.0, Color32::from_rgb(226, 228, 234));
+                        p.text(hr.left_center() + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, y.to_string(), FontId::proportional(18.0 * k), Color32::from_rgb(30, 32, 38));
+                        for k in 0..37 {
+                            let c = Pos2::new(hr.left() + slot_x(k) + day_w / 2.0, hr.center().y);
+                            let col = if k % 7 >= 5 { Color32::from_rgb(120, 122, 130) } else { Color32::from_rgb(40, 42, 48) };
+                            p.text(c, Align2::CENTER_CENTER, ["M", "T", "W", "T", "F", "S", "S"][k % 7], font.clone(), col);
+                        }
+                        for m in 1..=12u32 {
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(total_w, row_h), Sense::click());
+                            if scroll && (y, m) == (year, month) {
+                                ui.scroll_to_rect(r, Some(egui::Align::TOP));
+                                scroll = false;
+                            }
+                            let p = ui.painter();
+                            // every other week block lightly shaded, so the weekdays line up visibly
+                            for b in (1..6).step_by(2) {
+                                let x0 = r.left() + name_w + b as f32 * (wk_w + 7.0 * day_w);
+                                let x1 = (x0 + wk_w + 7.0 * day_w).min(r.right());
+                                p.rect_filled(Rect::from_x_y_ranges(x0..=x1, r.y_range()), 0.0, Color32::from_rgb(244, 245, 248));
+                            }
+                            p.text(r.left_center() + Vec2::new(4.0, 0.0), Align2::LEFT_CENTER, FULL_MONTHS[m as usize - 1], font.clone(), Color32::from_rgb(30, 32, 38));
+                            let first = days_from_civil(y, m, 1);
+                            let next = if m == 12 { days_from_civil(y + 1, 1, 1) } else { days_from_civil(y, m + 1, 1) };
+                            let wd = weekday(first) as usize;
+                            let hover = resp.hover_pos();
+                            let mut labelled = [false; 6];
+                            for day in first..next {
+                                let k = wd + (day - first) as usize;
+                                let cell = Rect::from_min_size(Pos2::new(r.left() + slot_x(k), r.top()), Vec2::new(day_w, row_h));
+                                if !labelled[k / 7] {
+                                    labelled[k / 7] = true;
+                                    let wx = r.left() + name_w + (k / 7) as f32 * (wk_w + 7.0 * day_w) + wk_w - 2.0;
+                                    p.text(Pos2::new(wx, r.bottom() - 3.0), Align2::RIGHT_BOTTOM, format!("{:02}", iso_week(day).1), small.clone(), ACCENT);
+                                }
+                                let hovered = hover.map(|h| cell.contains(h)).unwrap_or(false);
+                                if hovered {
+                                    hover_day = Some(day);
+                                    if resp.clicked() {
+                                        clicked_day = Some(day);
+                                    }
+                                }
+                            }
+                            // while picking, preview the period up to the day under the pointer (last frame's,
+                            // so the rows above it show the preview too)
+                            let shown = match (pending, last_hover) {
+                                (Some(a), Some(b)) => (a.min(b), a.max(b)),
+                                (Some(a), None) => (a, a),
+                                _ => period,
+                            };
+                            for day in first..next {
+                                let k = wd + (day - first) as usize;
+                                let cell = Rect::from_min_size(Pos2::new(r.left() + slot_x(k), r.top()), Vec2::new(day_w, row_h));
+                                let inside = day >= shown.0 && day <= shown.1;
+                                let hovered = hover.map(|h| cell.contains(h)).unwrap_or(false);
+                                let fill = if inside && pending.is_some() {
+                                    Some(Color32::from_rgb(226, 136, 98))
+                                } else if inside {
+                                    Some(ACCENT)
+                                } else if day == today {
+                                    Some(Color32::from_rgb(244, 170, 150))
+                                } else if hovered {
+                                    Some(Color32::from_rgb(214, 216, 224))
+                                } else {
+                                    None
+                                };
+                                if let Some(f) = fill {
+                                    p.rect_filled(cell, 0.0, f);
+                                }
+                                if day == today {
+                                    p.rect_stroke(cell.shrink(0.5), 0.0, Stroke::new(1.2, Color32::from_rgb(214, 36, 56)), StrokeKind::Inside);
+                                }
+                                if hovered && inside {
+                                    p.rect_stroke(cell.shrink(0.5), 0.0, Stroke::new(1.2, Color32::WHITE), StrokeKind::Inside);
+                                }
+                                let weekend = k % 7 >= 5;
+                                let col = if inside {
+                                    Color32::WHITE
+                                } else if weekend {
+                                    Color32::from_rgb(120, 122, 130)
+                                } else {
+                                    Color32::from_rgb(30, 32, 38)
+                                };
+                                let (_, _, dd) = civil_from_days(day);
+                                p.text(cell.center(), Align2::CENTER_CENTER, format!("{dd:02}"), font.clone(), col);
+                            }
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
                         }
                     }
-                    ui.end_row();
-                }
+                });
             });
-            ui.add_space(4.0);
-            let (ey, em, ed) = civil_from_days(end);
-            ui.horizontal(|ui| {
-                ui.label("Weeks");
-                ui.add(egui::DragValue::new(&mut weeks).range(1..=104));
-                ui.label(RichText::new(format!("{sd:02}.{sm:02}.{sy} – {ed:02}.{em:02}.{ey}")).color(Color32::GRAY));
-            });
-            ui.label(RichText::new("Click a day to start the timeline in its week. Bars keep their dates.").color(Color32::GRAY));
-            ui.horizontal(|ui| {
-                if ui.button("Fit scale to data").clicked() {
-                    fit = true;
+        let mut chosen = chosen;
+        let mut pending = pending;
+        if let Some(day) = clicked_day {
+            match pending.take() {
+                None => pending = Some(day),
+                Some(first) => {
+                    let (a, b) = (first.min(day), first.max(day));
+                    if let Some(g) = self.gantt_mut(id) {
+                        g.set_period(a, b);
+                        let w = g.weeks;
+                        chosen = Some((a, b));
+                        self.status = format!("The chart now shows {} to {} ({w} calendar week{}).", date(a), date(b), if w == 1 { "" } else { "s" });
+                    }
                 }
-                if ui.button("Today's week").clicked() {
-                    new_start = Some(today);
-                }
-            });
-        });
-        let Some(g) = self.gantt_mut(id) else { return };
-        g.weeks = weeks;
-        if let Some(day) = new_start {
-            g.set_start_keep_dates(day);
+            }
         }
         if fit {
-            g.fit_to_data();
+            if let Some(g) = self.gantt_mut(id) {
+                g.fit_to_data();
+                if let Some([y, m, _]) = g.start {
+                    (year, month, scroll) = (y, m as u32, true);
+                }
+            }
+            chosen = None;
+            pending = None;
         }
-        if let Some([y, m, _]) = (new_start.is_some() || fit).then_some(g.start).flatten() {
-            (year, month) = (y, m as u32);
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if pending.is_some() {
+                pending = None;
+            } else {
+                open = false;
+            }
         }
-        self.calendar_dlg = open.then_some(CalendarDlg { id, year, month });
+        if hover_day != last_hover {
+            ctx.request_repaint();
+        }
+        self.calendar_dlg = open.then_some(CalendarDlg { id, year, month, scroll, pending, chosen, hover: hover_day, fresh: false });
     }
 
     fn props_panel(&mut self, ui: &mut egui::Ui) {
@@ -2543,7 +2679,7 @@ impl ThinkCraft {
                     *d = dd as i32;
                     ui.horizontal(|ui| {
                         ui.label("Weeks");
-                        ui.add(egui::DragValue::new(&mut g.weeks).range(1..=104));
+                        ui.add(egui::DragValue::new(&mut g.weeks).range(1..=260));
                         ui.label(RichText::new(format!("(from week {wk})")).color(Color32::GRAY));
                     });
                     let mut has_today = g.today.is_some();
@@ -2589,7 +2725,7 @@ impl ThinkCraft {
                         g.today = if has_today { Some(t) } else { None };
                     });
                 }
-                ui.label(RichText::new("On the slide: drag a bar to move it in time, or up/down into another activity (an activity can hold several bars and milestones). Drag a bar's end to make it longer or shorter. Double-click an empty spot in a row to add a bar. Drag the date line left or right. Hold Option to move freely (no snapping to days). Click a bar or milestone to pick it: Cmd+C copies it and Cmd+V pastes the copy on top, ready to drag; arrow keys move it; Delete removes it. Right-click a bar for Copy, Cut, Paste and Delete. Right-click the chart for the round menu: label columns (activity, responsible, remark), fit scale to data, calendar, add or paste a bar there, and more.").color(Color32::from_rgb(90, 92, 100)));
+                ui.label(RichText::new("On the slide: drag a bar to move it in time, or up/down into another activity (an activity can hold several bars and milestones). Drag a bar's end to make it longer or shorter. Double-click an empty spot in a row to add a bar. Drag the date line left or right. Hold Option to move freely (no snapping to days). Click a bar or milestone to pick it: Cmd+C copies it and Cmd+V pastes the copy on top, ready to drag; arrow keys move it; Delete removes it. Right-click a bar for Copy, Cut, Paste and Delete. Right-click the chart for the round menu: label columns (activity on the left, responsible and remark on the right), fit scale to data, the calendar (click the first and the last day of the period to show), add or paste a bar there, and more.").color(Color32::from_rgb(90, 92, 100)));
                 ui.label("Names and exact numbers are in the datasheet below.");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Datasheet").clicked() {
@@ -2891,12 +3027,13 @@ impl ThinkCraft {
                             // one line per bar or milestone
                             for (bi, t) in task.bars.iter_mut().enumerate() {
                                 ui.label(RichText::new(if t.milestone { "      milestone" } else { "      bar" }).color(Color32::GRAY));
-                                ui.add(egui::DragValue::new(&mut t.start).speed(0.05).range(0.0..=maxp));
+                                // bars outside the timeline keep their dates (they are hidden, not cut)
+                                ui.add(egui::DragValue::new(&mut t.start).speed(0.05).range(0.0..=maxp).clamp_existing_to_range(false));
                                 if t.milestone {
                                     ui.label("—");
                                     t.end = t.start;
                                 } else {
-                                    ui.add(egui::DragValue::new(&mut t.end).speed(0.05).range(t.start..=maxp));
+                                    ui.add(egui::DragValue::new(&mut t.end).speed(0.05).range(t.start..=maxp).clamp_existing_to_range(false));
                                 }
                                 ui.checkbox(&mut t.milestone, "");
                                 ui.checkbox(&mut t.dashed, "");
@@ -3306,20 +3443,25 @@ fn radial_glyph(p: &egui::Painter, c: Pos2, cmd: RadialCmd, on: bool, enabled: b
         }
         RadialCmd::Activity | RadialCmd::Responsible | RadialCmd::Remark => {
             // a column divider with the column's letter on its side, and text lines below
-            let (x_line, letter_x, l) = match cmd {
-                RadialCmd::Activity => (2.0, -3.5, "A"),
-                RadialCmd::Responsible => (3.5, -2.5, "R"),
-                _ => (-4.5, 1.5, "R"),
-            };
+            // activity: "A" left of the divider; responsible and remark: two "R" columns right
+            // of it, the red one being the column this button adds or removes
+            let x_line = if cmd == RadialCmd::Activity { 2.0 } else { -6.0 };
             p.line_segment([c + v(x_line, -9.0), c + v(x_line, 8.0)], thin);
             p.line_segment([c + v(-9.0, -1.0), c + v(9.0, -1.0)], thin);
-            if cmd == RadialCmd::Responsible {
-                letter(c + v(-7.5, -5.0), "A", light, 8.5);
+            match cmd {
+                RadialCmd::Activity => letter(c + v(-3.5, -5.5), "A", red, 10.5),
+                RadialCmd::Responsible => {
+                    letter(c + v(-1.0, -5.5), "R", red, 10.5);
+                    letter(c + v(6.0, -5.5), "R", light, 10.5);
+                }
+                _ => {
+                    letter(c + v(-1.0, -5.5), "R", light, 10.5);
+                    letter(c + v(6.0, -5.5), "R", red, 10.5);
+                }
             }
-            letter(c + v(letter_x, -5.5), l, red, 10.5);
             for k in 0..3 {
                 let y = 2.5 + k as f32 * 2.6;
-                let (a, b) = if cmd == RadialCmd::Remark { (x_line + 2.0, 8.0) } else { (-8.0, x_line - 2.0) };
+                let (a, b) = if cmd == RadialCmd::Activity { (-8.0, x_line - 2.0) } else { (x_line + 2.0, 8.0) };
                 p.line_segment([c + v(a, y), c + v(b, y)], Stroke::new(1.0, light));
             }
             badge(on);
@@ -3618,14 +3760,14 @@ mod tests {
         let mut g = Gantt::calendar(2026, 11, 2, 13);
         let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(880.0, 390.0));
         let plain = draw::GanttGeo::new(r, 1.0, &g);
-        // a responsible column goes left of the timeline, a remark column right of it
+        // responsible and remark columns both go right of the timeline
         g.show_responsible = true;
         g.show_remark = true;
         g.tasks[3].responsible = "Ana".into();
         g.tasks[3].remark = "On budget".into();
         let both = draw::GanttGeo::new(r, 1.0, &g);
-        assert!(both.grid.left() > plain.grid.left() && both.grid.right() < plain.grid.right());
-        assert_eq!(both.grid.left(), both.activity_w + both.responsible_w);
+        assert!(both.grid.left() == plain.grid.left() && both.grid.right() < plain.grid.right());
+        assert_eq!(both.grid.right(), r.right() - both.responsible_w - both.remark_w);
         // they are saved, and older files without them still open
         let back: Gantt = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
         assert_eq!(back, g);
@@ -3642,7 +3784,14 @@ mod tests {
         g.set_start_keep_dates(days_from_civil(2026, 11, 18));
         assert_eq!(g.start, Some([2026, 11, 16]));
         assert_eq!((g.tasks[3].bars[0].start, g.tasks[3].bars[0].end), (2.0, 7.0));
-        // the kick-off milestone fell before the start and is held at the first day
-        assert_eq!(g.tasks[0].bars[0].start, 0.0);
+        // the kick-off milestone now falls before the start: it keeps its date and is hidden
+        assert_eq!(g.tasks[0].bars[0].start, -2.0);
+        let geo = draw::GanttGeo::new(r, 1.0, &g);
+        assert!(!geo.visible(&g.tasks[0].bars[0]) && geo.visible(&g.tasks[3].bars[0]));
+        // picking Wednesday 4.2.2026 to Monday 15.2.2027 on the calendar shows weeks 06/2026 to 07/2027
+        g.set_period(days_from_civil(2027, 2, 15), days_from_civil(2026, 2, 4));
+        assert_eq!((g.start, g.weeks), (Some([2026, 2, 2]), 55));
+        // and the kick-off (2.11.2026) is back in view, 39 weeks in
+        assert_eq!(g.tasks[0].bars[0].start, 39.0);
     }
 }

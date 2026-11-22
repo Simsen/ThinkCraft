@@ -900,12 +900,15 @@ pub struct GanttGeo {
     pub row_h: f32,
     pub bottom: f32,
     pub header_h: f32,
-    /// Width of everything left of the timeline (activity and responsible columns).
+    /// Width of everything left of the timeline (the activity column).
     pub label_w: f32,
-    /// Widths of the activity, responsible and remark label columns (0 when hidden).
+    /// Widths of the label columns (0 when hidden): activity left of the timeline,
+    /// responsible and then remark right of it.
     pub activity_w: f32,
     pub responsible_w: f32,
     pub remark_w: f32,
+    /// Number of columns (weeks or periods) on the timeline.
+    pub cols: f32,
 }
 
 impl GanttGeo {
@@ -913,14 +916,14 @@ impl GanttGeo {
         let activity_w = if g.show_activity { (r.width() * 0.2).max(60.0 * s) } else { 0.0 };
         let responsible_w = if g.show_responsible { (r.width() * 0.12).max(48.0 * s) } else { 0.0 };
         let remark_w = if g.show_remark { (r.width() * 0.15).max(56.0 * s) } else { 0.0 };
-        let label_w = activity_w + responsible_w;
+        let label_w = activity_w;
         let header_h = if g.start.is_some() { 20.0 * s * g.scales.iter().filter(|b| **b).count().max(1) as f32 } else { 24.0 * s };
-        let right = (r.right() - remark_w).max(r.left() + label_w + 20.0 * s);
+        let right = (r.right() - responsible_w - remark_w).max(r.left() + label_w + 20.0 * s);
         let grid = Rect::from_min_max(Pos2::new(r.left() + label_w, r.top() + header_h), Pos2::new(right, r.bottom() - 18.0 * s));
         let col_w = grid.width() / g.columns() as f32;
         let rows = g.tasks.len().max(1);
         let row_h = (grid.height() / rows as f32).min(44.0 * s);
-        GanttGeo { grid, col_w, row_h, bottom: grid.top() + row_h * rows as f32, header_h, label_w, activity_w, responsible_w, remark_w }
+        GanttGeo { grid, col_w, row_h, bottom: grid.top() + row_h * rows as f32, header_h, label_w, activity_w, responsible_w, remark_w, cols: g.columns() as f32 }
     }
     pub fn x(&self, t: f32) -> f32 {
         self.grid.left() + t * self.col_w
@@ -935,13 +938,23 @@ impl GanttGeo {
     pub fn row_at(&self, y: f32, rows: usize) -> usize {
         (((y - self.grid.top()) / self.row_h.max(1.0)).floor().max(0.0) as usize).min(rows.saturating_sub(1))
     }
-    /// The screen rectangle of a bar (or milestone diamond) on row `i`.
+    /// Whether a bar (or milestone) falls inside the timeline. Bars outside keep their dates
+    /// but are not drawn, so a shorter period on the calendar doesn't lose any work.
+    pub fn visible(&self, t: &Bar) -> bool {
+        if t.milestone {
+            t.start >= 0.0 && t.start <= self.cols
+        } else {
+            t.end > 0.0 && t.start < self.cols
+        }
+    }
+    /// The screen rectangle of a bar (or milestone diamond) on row `i`, cut to the timeline.
     pub fn bar_rect(&self, t: &Bar, i: usize) -> Rect {
         let cy = self.row_center(i);
         if t.milestone {
             Rect::from_center_size(Pos2::new(self.x(t.start), cy), Vec2::splat(self.row_h * 0.56))
         } else {
-            Rect::from_x_y_ranges(self.x(t.start)..=self.x(t.end.max(t.start + 0.05)), cy - self.row_h * 0.22..=cy + self.row_h * 0.22)
+            let (a, b) = (t.start.max(0.0), t.end.max(t.start + 0.05).min(self.cols));
+            Rect::from_x_y_ranges(self.x(a)..=self.x(b.max(a)), cy - self.row_h * 0.22..=cy + self.row_h * 0.22)
         }
     }
 }
@@ -953,12 +966,12 @@ fn label_headers(p: &Canvas, r: Rect, geo: &GanttGeo, g: &Gantt, y: f32, size: f
         text(p, Pos2::new(r.left(), y), Align2::LEFT_CENTER, &fit_text(p, &g.header, size, geo.activity_w - 4.0 * s), size, col);
     }
     if g.show_responsible {
-        let w = geo.responsible_w - 6.0 * s;
-        text(p, Pos2::new(r.left() + geo.activity_w + 2.0 * s, y), Align2::LEFT_CENTER, &fit_text(p, &g.responsible_header, size, w), size, col);
+        let w = geo.responsible_w - 8.0 * s;
+        text(p, Pos2::new(geo.grid.right() + 6.0 * s, y), Align2::LEFT_CENTER, &fit_text(p, &g.responsible_header, size, w), size, col);
     }
     if g.show_remark {
         let w = geo.remark_w - 8.0 * s;
-        text(p, Pos2::new(geo.grid.right() + 6.0 * s, y), Align2::LEFT_CENTER, &fit_text(p, &g.remark_header, size, w), size, col);
+        text(p, Pos2::new(geo.grid.right() + geo.responsible_w + 6.0 * s, y), Align2::LEFT_CENTER, &fit_text(p, &g.remark_header, size, w), size, col);
     }
 }
 
@@ -1066,17 +1079,17 @@ pub fn draw_gantt(p: &Canvas, r: Rect, s: f32, g: &Gantt, style: &Style) {
             text(p, Pos2::new(r.left(), cy), Align2::LEFT_CENTER, &row.label, lbl, INK);
         }
         if g.show_responsible {
-            let w = geo.responsible_w - 6.0 * s;
-            text(p, Pos2::new(r.left() + geo.activity_w + 2.0 * s, cy), Align2::LEFT_CENTER, &fit_text(p, &row.responsible, lbl, w), lbl, INK);
+            let w = geo.responsible_w - 8.0 * s;
+            text(p, Pos2::new(grid.right() + 6.0 * s, cy), Align2::LEFT_CENTER, &fit_text(p, &row.responsible, lbl, w), lbl, INK);
         }
         if g.show_remark {
             let w = geo.remark_w - 8.0 * s;
-            text(p, Pos2::new(grid.right() + 6.0 * s, cy), Align2::LEFT_CENTER, &fit_text(p, &row.remark, lbl, w), lbl, INK);
+            text(p, Pos2::new(grid.right() + geo.responsible_w + 6.0 * s, cy), Align2::LEFT_CENTER, &fit_text(p, &row.remark, lbl, w), lbl, INK);
         }
         if i + 1 < rows {
             p.line_segment([Pos2::new(r.left(), cy + row_h / 2.0), Pos2::new(r.right(), cy + row_h / 2.0)], Stroke::new(0.4 * s, GRID));
         }
-        for t in &row.bars {
+        for t in row.bars.iter().filter(|t| geo.visible(t)) {
         let col = rgb(style.colors[t.color % style.colors.len()]);
         if t.milestone {
             let c = Pos2::new(x_of(t.start), cy);
@@ -1090,7 +1103,7 @@ pub fn draw_gantt(p: &Canvas, r: Rect, s: f32, g: &Gantt, style: &Style) {
                 Stroke::NONE,
             ));
         } else {
-            let bar = Rect::from_x_y_ranges(x_of(t.start)..=x_of(t.end.max(t.start + 0.05)), cy - row_h * 0.22..=cy + row_h * 0.22);
+            let bar = geo.bar_rect(t, i);
             if t.dashed {
                 // planned or optional work: dashed outline
                 let st = Stroke::new(1.2 * s, col);

@@ -573,7 +573,7 @@ impl Gantt {
     }
 
     /// Calendar mode: starts the timeline on the Monday of `days` (days since 1970) while
-    /// every bar keeps its date; bars that fall outside are cut to the timeline.
+    /// every bar keeps its date; bars outside the timeline are hidden until it covers them again.
     pub fn set_start_keep_dates(&mut self, days: i64) {
         let Some([y, m, d]) = self.start else { return };
         let old = days_from_civil(y, m.max(1) as u32, d.max(1) as u32);
@@ -581,11 +581,16 @@ impl Gantt {
         let (yy, mm, dd) = civil_from_days(monday);
         self.start = Some([yy, mm as i32, dd as i32]);
         self.shift_bars((old - monday) as f32 / 7.0);
-        let cols = self.columns() as f32;
-        for b in self.tasks.iter_mut().flat_map(|t| t.bars.iter_mut()) {
-            b.start = b.start.clamp(0.0, cols);
-            b.end = if b.milestone { b.start } else { b.end.clamp(b.start, cols) };
-        }
+    }
+
+    /// Calendar mode: shows the period from day `first` to day `last` (days since 1970):
+    /// the timeline runs from the Monday of the first day's week through the last day's week.
+    /// Bars keep their dates.
+    pub fn set_period(&mut self, first: i64, last: i64) {
+        let (first, last) = (first.min(last), first.max(last));
+        self.set_start_keep_dates(first);
+        let monday = first - weekday(first) as i64;
+        self.weeks = ((last - monday) / 7 + 1).clamp(1, 260) as u32;
     }
 
     fn shift_bars(&mut self, by: f32) {
