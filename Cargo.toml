@@ -1,0 +1,31 @@
+[package]
+name = "thinkcraft"
+version = "0.1.0"
+edition = "2021"
+description = "ThinkCraft - business charts and slide layouts"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Simsen/ThinkCraft"
+
+[[bin]]
+name = "thinkcraft"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.18"
+winit = "0.30"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+calamine = "0.38"
+
+[profile.release]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
