@@ -445,7 +445,7 @@ pub fn write_pptx(path: &Path, deck: &Deck, slides: &[usize], painter: &Painter)
     files.push(("ppt/presProps.xml".into(), format!("{HDR}<p:presentationPr {NS}/>")));
     files.push((
         "ppt/viewProps.xml".into(),
-        format!("{HDR}<p:viewPr {NS}><p:normalViewPr/><p:gridSpacing cx=\"76200\" cy=\"76200\"/></p:viewPr>"),
+        format!("{HDR}<p:viewPr {NS}><p:normalViewPr><p:restoredLeft sz=\"15620\"/><p:restoredTop sz=\"94660\"/></p:normalViewPr><p:gridSpacing cx=\"76200\" cy=\"76200\"/></p:viewPr>"),
     ));
     files.push((
         "ppt/tableStyles.xml".into(),
