@@ -34,6 +34,9 @@
   <sub>A stacked chart with a CAGR annotation, a text box and Harvey balls, with the datasheet open below.</sub>
 </p>
 
+> [!WARNING]
+> **ThinkCraft is in early alpha.** It works, but expect rough edges, missing features and changes to the `.tcraft` file format between versions. Keep copies of decks you care about, and please [report problems](https://github.com/Simsen/ThinkCraft/issues) you run into.
+
 <br>
 
 <table>
