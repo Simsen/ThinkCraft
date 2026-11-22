@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-latest
+            name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/thinkcraft.exe dist/ThinkCraft.exe
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE dist/
+          Compress-Archive -Path dist/* -DestinationPath thinkcraft-${{ matrix.name }}.zip -Force
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sh make-mac-app.sh
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/
+          cd dist && ditto -c -k --keepParent ThinkCraft.app ../thinkcraft-${{ matrix.name }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thinkcraft-${{ matrix.name }}
+          path: thinkcraft-${{ matrix.name }}.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: thinkcraft-${{ matrix.name }}.zip

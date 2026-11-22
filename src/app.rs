@@ -501,12 +501,12 @@ impl ThinkCraft {
         let clip = if let Some((id, row, bi)) = self.gantt_item() {
             let Some(g) = self.gantt_mut(id) else { return false };
             let bar = g.tasks[row].bars[bi].clone();
-            self.status = format!("Copied {}. Press Cmd+V to paste it, then drag it where it should go.", self.item_name((id, row, bi)));
+            self.status = keys(&format!("Copied {}. Press Cmd+V to paste it, then drag it where it should go.", self.item_name((id, row, bi))));
             Clip::GanttItem { row, bar }
         } else if !self.selected.is_empty() {
             let sel = self.selected.clone();
             let els: Vec<Element> = self.deck.slides[self.current].elements.iter().filter(|e| sel.contains(&e.id)).cloned().collect();
-            self.status = format!("Copied {} element{}. Press Cmd+V to paste.", els.len(), if els.len() == 1 { "" } else { "s" });
+            self.status = keys(&format!("Copied {} element{}. Press Cmd+V to paste.", els.len(), if els.len() == 1 { "" } else { "s" }));
             Clip::Elements(els)
         } else {
             self.status = "Select something to copy: click a bar in a Gantt chart, or an element.".into();
@@ -836,7 +836,7 @@ impl ThinkCraft {
                     None => match self.clip.clone() {
                         Some(c) => c,
                         None => {
-                            self.status = "Nothing copied yet. Click a bar or an element and press Cmd+C first.".into();
+                            self.status = keys("Nothing copied yet. Click a bar or an element and press Cmd+C first.");
                             return;
                         }
                     },
@@ -1175,7 +1175,7 @@ impl ThinkCraft {
                     self.actions.push(Action::Open);
                 }
                 ui.separator();
-                if ui.button("Save  (Cmd+S)").clicked() {
+                if ui.button(keys("Save  (Cmd+S)")).clicked() {
                     self.actions.push(Action::Save);
                 }
                 if ui.button("Save as…").clicked() {
@@ -1193,20 +1193,20 @@ impl ThinkCraft {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  (Cmd+Z)")).clicked() {
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new(keys("Undo  (Cmd+Z)"))).clicked() {
                     self.actions.push(Action::Undo);
                 }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo  (Shift+Cmd+Z)")).clicked() {
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new(keys("Redo  (Shift+Cmd+Z)"))).clicked() {
                     self.actions.push(Action::Redo);
                 }
                 ui.separator();
-                if ui.button("Duplicate  (Cmd+D)").clicked() {
+                if ui.button(keys("Duplicate  (Cmd+D)")).clicked() {
                     self.actions.push(Action::Duplicate);
                 }
                 if ui.button("Delete  (Backspace)").clicked() {
                     self.actions.push(Action::Delete);
                 }
-                if ui.button("Select all  (Cmd+A)").clicked() {
+                if ui.button(keys("Select all  (Cmd+A)")).clicked() {
                     self.actions.push(Action::SelectAll);
                 }
                 ui.separator();
@@ -1904,10 +1904,10 @@ impl ThinkCraft {
                 self.gantt_sel = picked;
                 if let Some(item) = picked {
                     self.selected = vec![item.0];
-                    self.status = format!(
+                    self.status = keys(&format!(
                         "Picked {}. Cmd+C copies it, Cmd+V pastes, Delete removes it, arrows move it. Right-click for more.",
                         self.item_name(item)
-                    );
+                    ));
                 } else {
                     match hit(&self.deck.slides[self.current], p) {
                         Some(id) if shift => {
@@ -2017,7 +2017,7 @@ impl ThinkCraft {
                 let name = self.item_name(item);
                 ui.label(RichText::new(name[..1].to_uppercase() + &name[1..]).small().color(Color32::GRAY));
                 let mut entry = |ui: &mut egui::Ui, label: &str, keys: &str, a: Action| {
-                    if ui.add(egui::Button::new(label).shortcut_text(keys)).clicked() {
+                    if ui.add(egui::Button::new(label).shortcut_text(self::keys(keys))).clicked() {
                         self.actions.push(a);
                         ui.close();
                     }
@@ -2036,19 +2036,19 @@ impl ThinkCraft {
                 }
                 return;
             }
-            if ui.add_enabled(has, egui::Button::new("Copy").shortcut_text("⌘C")).clicked() {
+            if ui.add_enabled(has, egui::Button::new("Copy").shortcut_text(keys("⌘C"))).clicked() {
                 self.actions.push(Action::Copy);
                 ui.close();
             }
-            if ui.add_enabled(has, egui::Button::new("Cut").shortcut_text("⌘X")).clicked() {
+            if ui.add_enabled(has, egui::Button::new("Cut").shortcut_text(keys("⌘X"))).clicked() {
                 self.actions.push(Action::Cut);
                 ui.close();
             }
-            if ui.add_enabled(can_paste, egui::Button::new("Paste").shortcut_text("⌘V")).clicked() {
+            if ui.add_enabled(can_paste, egui::Button::new("Paste").shortcut_text(keys("⌘V"))).clicked() {
                 self.actions.push(Action::Paste { text: None, at: None });
                 ui.close();
             }
-            if ui.add_enabled(has, egui::Button::new("Duplicate").shortcut_text("⌘D")).clicked() {
+            if ui.add_enabled(has, egui::Button::new("Duplicate").shortcut_text(keys("⌘D"))).clicked() {
                 self.actions.push(Action::Duplicate);
                 ui.close();
             }
@@ -2524,7 +2524,7 @@ impl ThinkCraft {
         });
         ui.add_space(12.0);
         ui.label(RichText::new("Tips").strong());
-        ui.label("• Click an element to select it, Shift-click to add more.\n• Drag on empty space to select several.\n• Elements snap to each other and to the slide margins; hold Option to move freely.\n• Double-click a chart to open its datasheet.\n• Arrow keys nudge, Shift + arrow nudges further.");
+        ui.label(keys("• Click an element to select it, Shift-click to add more.\n• Drag on empty space to select several.\n• Elements snap to each other and to the slide margins; hold Option to move freely.\n• Double-click a chart to open its datasheet.\n• Arrow keys nudge, Shift + arrow nudges further."));
     }
 
     fn element_props(&mut self, ui: &mut egui::Ui, idx: usize) {
@@ -2725,7 +2725,7 @@ impl ThinkCraft {
                         g.today = if has_today { Some(t) } else { None };
                     });
                 }
-                ui.label(RichText::new("On the slide: drag a bar to move it in time, or up/down into another activity (an activity can hold several bars and milestones). Drag a bar's end to make it longer or shorter. Double-click an empty spot in a row to add a bar. Drag the date line left or right. Hold Option to move freely (no snapping to days). Click a bar or milestone to pick it: Cmd+C copies it and Cmd+V pastes the copy on top, ready to drag; arrow keys move it; Delete removes it. Right-click a bar for Copy, Cut, Paste and Delete. Right-click the chart for the round menu: label columns (activity on the left, responsible and remark on the right), fit scale to data, the calendar (click the first and the last day of the period to show), add or paste a bar there, and more.").color(Color32::from_rgb(90, 92, 100)));
+                ui.label(RichText::new(keys("On the slide: drag a bar to move it in time, or up/down into another activity (an activity can hold several bars and milestones). Drag a bar's end to make it longer or shorter. Double-click an empty spot in a row to add a bar. Drag the date line left or right. Hold Option to move freely (no snapping to days). Click a bar or milestone to pick it: Cmd+C copies it and Cmd+V pastes the copy on top, ready to drag; arrow keys move it; Delete removes it. Right-click a bar for Copy, Cut, Paste and Delete. Right-click the chart for the round menu: label columns (activity on the left, responsible and remark on the right), fit scale to data, the calendar (click the first and the last day of the period to show), add or paste a bar there, and more.")).color(Color32::from_rgb(90, 92, 100)));
                 ui.label("Names and exact numbers are in the datasheet below.");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Datasheet").clicked() {
@@ -3229,7 +3229,7 @@ impl ThinkCraft {
                 .default_width(460.0)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("Copy cells in Excel (or any spreadsheet) and paste them here with Cmd+V.\nFirst row: column names. First column: series names.");
+                    ui.label(keys("Copy cells in Excel (or any spreadsheet) and paste them here with Cmd+V.\nFirst row: column names. First column: series names."));
                     ui.add(egui::TextEdit::multiline(text).desired_rows(10).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("\t2023\t2024\nEurope\t42\t48\nAsia\t14\t19"));
                     if !err.is_empty() {
                         ui.colored_label(Color32::from_rgb(190, 50, 40), err.as_str());
@@ -3662,8 +3662,18 @@ fn open_with(p: &Path, mac_app: &str, short: &str) -> String {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let _ = mac_app;
-        let ok = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(p).status().map(|s| s.success()).unwrap_or(false);
+        // `start "" "<path>"` opens the file in its default app (PowerPoint, Excel).
+        // The path is always quoted so spaces and characters like & are safe,
+        // and CREATE_NO_WINDOW keeps a console window from flashing up.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let ok = std::process::Command::new("cmd")
+            .raw_arg(format!("/C start \"\" \"{}\"", p.display()))
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         if ok {
             return format!("Opened in {short}.");
         }
@@ -3793,5 +3803,32 @@ mod tests {
         assert_eq!((g.start, g.weeks), (Some([2026, 2, 2]), 55));
         // and the kick-off (2.11.2026) is back in view, 39 weeks in
         assert_eq!(g.tasks[0].bars[0].start, 39.0);
+    }
+}
+
+/// Shortcut names as this computer shows them: Cmd/⌘/Option on a Mac, Ctrl/Alt elsewhere.
+/// Text is written with Mac names and passed through here before it is shown.
+fn keys(text: &str) -> String {
+    if cfg!(target_os = "macos") {
+        return text.to_string();
+    }
+    text.replace("Shift+Cmd+", "Ctrl+Shift+")
+        .replace("Cmd+", "Ctrl+")
+        .replace('⌘', "Ctrl+")
+        .replace("Option", "Alt")
+}
+
+#[cfg(test)]
+mod key_label_tests {
+    use super::keys;
+
+    #[test]
+    fn shortcut_labels_follow_the_platform() {
+        let shown = keys("Undo  (Cmd+Z) · Redo  (Shift+Cmd+Z) · ⌘C · hold Option");
+        if cfg!(target_os = "macos") {
+            assert_eq!(shown, "Undo  (Cmd+Z) · Redo  (Shift+Cmd+Z) · ⌘C · hold Option");
+        } else {
+            assert_eq!(shown, "Undo  (Ctrl+Z) · Redo  (Ctrl+Shift+Z) · Ctrl+C · hold Alt");
+        }
     }
 }

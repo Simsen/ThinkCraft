@@ -12,7 +12,8 @@
 
 <p align="center">
   <img alt="100% Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
-  <img alt="UI: egui" src="https://img.shields.io/badge/UI-egui-2f7bf5?style=flat-square">
+  <img alt="Windows · macOS" src="https://img.shields.io/badge/Windows%20%C2%B7%20macOS-native-2f7bf5?style=flat-square">
+  <img alt="UI: egui" src="https://img.shields.io/badge/UI-egui-5a5a5a?style=flat-square">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-3a3a3a?style=flat-square">
   <img alt="Status: early alpha" src="https://img.shields.io/badge/status-early%20alpha-d69e2e?style=flat-square">
 </p>
@@ -152,7 +153,9 @@ thinkcraft deck.tcraft --screenshot slide.png       # render the window to a PNG
 
 ## Get started
 
-Requires a Rust toolchain ([rustup](https://rustup.rs)).
+**Just want to use it?** Download the Windows or macOS build from the [latest release](https://github.com/Simsen/ThinkCraft/releases).
+
+To build it yourself you need a Rust toolchain ([rustup](https://rustup.rs)); on Windows, let rustup install the Visual Studio C++ build tools.
 
 ```sh
 git clone https://github.com/Simsen/ThinkCraft
@@ -160,12 +163,13 @@ cd ThinkCraft
 cargo run --release      # the desktop app
 cargo test               # the tests
 sh make-mac-app.sh       # macOS: build dist/ThinkCraft.app
+                         # Windows: the app is target\release\thinkcraft.exe
 ```
 
-See [HOW-TO-START.md](HOW-TO-START.md) for installing the macOS app bundle and where your work is kept.
+See [HOW-TO-START.md](HOW-TO-START.md) for installing on Windows and macOS, keyboard shortcuts and where your work is kept.
 
 > [!IMPORTANT]
-> **Status:** ThinkCraft is in early alpha. It is developed and tested on macOS; other platforms may build but are untested. File formats may still change between versions.
+> **Status:** ThinkCraft is in early alpha. It runs on Windows and macOS; every change is built and tested on both by [GitHub Actions](https://github.com/Simsen/ThinkCraft/actions). Linux may build but is untested. File formats may still change between versions.
 
 ## License
 
