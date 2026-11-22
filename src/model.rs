@@ -424,6 +424,12 @@ pub struct Bar {
 pub struct Task {
     pub label: String,
     pub bars: Vec<Bar>,
+    /// Who is responsible (shown when the chart has a responsible column).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub responsible: String,
+    /// A remark (shown when the chart has a remark column, right of the timeline).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remark: String,
 }
 
 /// Reads both the current layout and older files where a row had exactly one bar.
@@ -442,6 +448,10 @@ struct TaskRaw {
     dashed: bool,
     #[serde(default)]
     color: usize,
+    #[serde(default)]
+    responsible: String,
+    #[serde(default)]
+    remark: String,
 }
 
 impl From<TaskRaw> for Task {
@@ -449,14 +459,19 @@ impl From<TaskRaw> for Task {
         let bars = r.bars.unwrap_or_else(|| {
             vec![Bar { start: r.start, end: r.end, milestone: r.milestone, dashed: r.dashed, color: r.color }]
         });
-        Task { label: r.label, bars }
+        Task { label: r.label, bars, responsible: r.responsible, remark: r.remark }
     }
 }
 
 impl Task {
     /// A row with a single bar (or milestone when `milestone` is true).
     pub fn one(label: &str, start: f32, end: f32, milestone: bool, color: usize, dashed: bool) -> Self {
-        Task { label: label.to_string(), bars: vec![Bar { start, end, milestone, dashed, color }] }
+        Task::new(label, vec![Bar { start, end, milestone, dashed, color }])
+    }
+
+    /// A row with the given bars and no responsible or remark.
+    pub fn new(label: &str, bars: Vec<Bar>) -> Self {
+        Task { label: label.to_string(), bars, responsible: String::new(), remark: String::new() }
     }
 }
 
@@ -482,6 +497,18 @@ pub struct Gantt {
     /// instead of following the real date.
     #[serde(default)]
     pub today_fixed: bool,
+    /// Label columns: activity names left of the timeline, who is responsible next to them,
+    /// and remarks right of the timeline.
+    #[serde(default = "yes")]
+    pub show_activity: bool,
+    #[serde(default)]
+    pub show_responsible: bool,
+    #[serde(default)]
+    pub show_remark: bool,
+    #[serde(default = "responsible_header")]
+    pub responsible_header: String,
+    #[serde(default = "remark_header")]
+    pub remark_header: String,
 }
 
 impl Gantt {
@@ -512,6 +539,67 @@ impl Gantt {
         }
     }
 
+    /// Shrinks or grows the timeline to just hold every bar and milestone: in calendar
+    /// mode from the week of the earliest to the week of the latest, with own periods by
+    /// dropping empty periods at both ends. Bars keep their dates. False if there are no bars.
+    pub fn fit_to_data(&mut self) -> bool {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for b in self.tasks.iter().flat_map(|t| t.bars.iter()) {
+            lo = lo.min(b.start);
+            hi = hi.max(b.end.max(b.start));
+        }
+        if lo > hi {
+            return false;
+        }
+        let shift = lo.floor().max(if self.start.is_some() { f32::MIN } else { 0.0 });
+        let span = ((hi - shift).ceil().max(1.0)) as usize;
+        match self.start {
+            Some([y, m, d]) => {
+                let start = days_from_civil(y, m.max(1) as u32, d.max(1) as u32) + shift as i64 * 7;
+                let (yy, mm, dd) = civil_from_days(start);
+                self.start = Some([yy, mm as i32, dd as i32]);
+                self.weeks = span as u32;
+            }
+            None => {
+                let first = (shift as usize).min(self.periods.len());
+                let last = (first + span).min(self.periods.len()).max(first);
+                if last > first {
+                    self.periods = self.periods[first..last].to_vec();
+                }
+            }
+        }
+        self.shift_bars(-shift);
+        true
+    }
+
+    /// Calendar mode: starts the timeline on the Monday of `days` (days since 1970) while
+    /// every bar keeps its date; bars that fall outside are cut to the timeline.
+    pub fn set_start_keep_dates(&mut self, days: i64) {
+        let Some([y, m, d]) = self.start else { return };
+        let old = days_from_civil(y, m.max(1) as u32, d.max(1) as u32);
+        let monday = days - weekday(days) as i64;
+        let (yy, mm, dd) = civil_from_days(monday);
+        self.start = Some([yy, mm as i32, dd as i32]);
+        self.shift_bars((old - monday) as f32 / 7.0);
+        let cols = self.columns() as f32;
+        for b in self.tasks.iter_mut().flat_map(|t| t.bars.iter_mut()) {
+            b.start = b.start.clamp(0.0, cols);
+            b.end = if b.milestone { b.start } else { b.end.clamp(b.start, cols) };
+        }
+    }
+
+    fn shift_bars(&mut self, by: f32) {
+        for b in self.tasks.iter_mut().flat_map(|t| t.bars.iter_mut()) {
+            b.start += by;
+            b.end += by;
+        }
+        if self.start.is_none() || self.today_fixed {
+            if let Some(t) = self.today.as_mut() {
+                *t += by;
+            }
+        }
+    }
+
     /// Smallest step for dragging: one day in calendar mode, a quarter period otherwise.
     pub fn snap_step(&self) -> f32 {
         if self.start.is_some() {
@@ -534,6 +622,18 @@ fn activity_header() -> String {
     "Activity".into()
 }
 
+fn yes() -> bool {
+    true
+}
+
+fn responsible_header() -> String {
+    "Responsible".into()
+}
+
+fn remark_header() -> String {
+    "Remark".into()
+}
+
 impl Gantt {
     pub fn columns(&self) -> usize {
         if self.start.is_some() {
@@ -553,13 +653,13 @@ impl Gantt {
             tasks: vec![
                 Task::one("Kick-off", 0.0, 0.0, true, 0, false),
                 Task::one("Requirements", 0.0, 2.0, false, 0, false),
-                Task {
-                    label: "Design".into(),
-                    bars: vec![
+                Task::new(
+                    "Design",
+                    vec![
                         Bar { start: 1.5, end: 4.0, milestone: false, dashed: false, color: 0 },
                         Bar { start: 4.5, end: 4.5, milestone: true, dashed: false, color: 1 },
                     ],
-                },
+                ),
                 Task::one("Build", 4.0, 9.0, false, 1, false),
                 Task::one("Test", 8.0, 11.0, false, 2, true),
                 Task::one("Go-live", 11.5, 11.5, true, 0, false),
@@ -571,6 +671,11 @@ impl Gantt {
             scales: default_scales(),
             separators: default_separators(),
             today_fixed: false,
+            show_activity: true,
+            show_responsible: false,
+            show_remark: false,
+            responsible_header: responsible_header(),
+            remark_header: remark_header(),
         }
     }
 }
@@ -644,6 +749,11 @@ impl Default for Gantt {
             scales: default_scales(),
             separators: default_separators(),
             today_fixed: false,
+            show_activity: true,
+            show_responsible: false,
+            show_remark: false,
+            responsible_header: responsible_header(),
+            remark_header: remark_header(),
         }
     }
 }

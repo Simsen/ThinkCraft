@@ -900,18 +900,27 @@ pub struct GanttGeo {
     pub row_h: f32,
     pub bottom: f32,
     pub header_h: f32,
+    /// Width of everything left of the timeline (activity and responsible columns).
     pub label_w: f32,
+    /// Widths of the activity, responsible and remark label columns (0 when hidden).
+    pub activity_w: f32,
+    pub responsible_w: f32,
+    pub remark_w: f32,
 }
 
 impl GanttGeo {
     pub fn new(r: Rect, s: f32, g: &Gantt) -> Self {
-        let label_w = (r.width() * 0.2).max(60.0 * s);
+        let activity_w = if g.show_activity { (r.width() * 0.2).max(60.0 * s) } else { 0.0 };
+        let responsible_w = if g.show_responsible { (r.width() * 0.12).max(48.0 * s) } else { 0.0 };
+        let remark_w = if g.show_remark { (r.width() * 0.15).max(56.0 * s) } else { 0.0 };
+        let label_w = activity_w + responsible_w;
         let header_h = if g.start.is_some() { 20.0 * s * g.scales.iter().filter(|b| **b).count().max(1) as f32 } else { 24.0 * s };
-        let grid = Rect::from_min_max(Pos2::new(r.left() + label_w, r.top() + header_h), Pos2::new(r.right(), r.bottom() - 18.0 * s));
+        let right = (r.right() - remark_w).max(r.left() + label_w + 20.0 * s);
+        let grid = Rect::from_min_max(Pos2::new(r.left() + label_w, r.top() + header_h), Pos2::new(right, r.bottom() - 18.0 * s));
         let col_w = grid.width() / g.columns() as f32;
         let rows = g.tasks.len().max(1);
         let row_h = (grid.height() / rows as f32).min(44.0 * s);
-        GanttGeo { grid, col_w, row_h, bottom: grid.top() + row_h * rows as f32, header_h, label_w }
+        GanttGeo { grid, col_w, row_h, bottom: grid.top() + row_h * rows as f32, header_h, label_w, activity_w, responsible_w, remark_w }
     }
     pub fn x(&self, t: f32) -> f32 {
         self.grid.left() + t * self.col_w
@@ -935,6 +944,37 @@ impl GanttGeo {
             Rect::from_x_y_ranges(self.x(t.start)..=self.x(t.end.max(t.start + 0.05)), cy - self.row_h * 0.22..=cy + self.row_h * 0.22)
         }
     }
+}
+
+/// The headings of the label columns, on the header row at height `y`.
+fn label_headers(p: &Canvas, r: Rect, geo: &GanttGeo, g: &Gantt, y: f32, size: f32, col: Color32) {
+    let s = size / 11.0;
+    if g.show_activity {
+        text(p, Pos2::new(r.left(), y), Align2::LEFT_CENTER, &fit_text(p, &g.header, size, geo.activity_w - 4.0 * s), size, col);
+    }
+    if g.show_responsible {
+        let w = geo.responsible_w - 6.0 * s;
+        text(p, Pos2::new(r.left() + geo.activity_w + 2.0 * s, y), Align2::LEFT_CENTER, &fit_text(p, &g.responsible_header, size, w), size, col);
+    }
+    if g.show_remark {
+        let w = geo.remark_w - 8.0 * s;
+        text(p, Pos2::new(geo.grid.right() + 6.0 * s, y), Align2::LEFT_CENTER, &fit_text(p, &g.remark_header, size, w), size, col);
+    }
+}
+
+/// Shortens `t` with an ellipsis so it fits in `width` at text size `size`.
+fn fit_text(p: &Canvas, t: &str, size: f32, width: f32) -> String {
+    if width <= 0.0 || p.measure(t, size).x <= width {
+        return t.to_string();
+    }
+    let chars: Vec<char> = t.chars().collect();
+    for n in (0..chars.len()).rev() {
+        let cut: String = chars[..n].iter().collect::<String>().trim_end().to_string() + "…";
+        if p.measure(&cut, size).x <= width {
+            return cut;
+        }
+    }
+    String::new()
 }
 
 pub fn draw_gantt(p: &Canvas, r: Rect, s: f32, g: &Gantt, style: &Style) {
@@ -999,11 +1039,11 @@ pub fn draw_gantt(p: &Canvas, r: Rect, s: f32, g: &Gantt, style: &Style) {
             }
             for ri in 1..active.len() {
                 let y = r.top() + row * ri as f32;
-                p.line_segment([Pos2::new(grid.left(), y), Pos2::new(r.right(), y)], Stroke::new(0.6 * s, MUTED));
+                p.line_segment([Pos2::new(grid.left(), y), Pos2::new(grid.right(), y)], Stroke::new(0.6 * s, MUTED));
             }
-            text(p, Pos2::new(r.left(), r.top() + row * (active.len() as f32 - 0.5)), Align2::LEFT_CENTER, &g.header, lbl * 1.05, INK);
+            label_headers(p, r, &geo, g, r.top() + row * (active.len() as f32 - 0.5), lbl * 1.05, INK);
             p.line_segment([Pos2::new(grid.left(), grid.top()), Pos2::new(grid.left(), bottom)], strong);
-            p.line_segment([Pos2::new(r.right(), grid.top()), Pos2::new(r.right(), bottom)], strong);
+            p.line_segment([Pos2::new(grid.right(), grid.top()), Pos2::new(grid.right(), bottom)], strong);
         }
         None => {
             for (i, name) in g.periods.iter().enumerate() {
@@ -1014,7 +1054,7 @@ pub fn draw_gantt(p: &Canvas, r: Rect, s: f32, g: &Gantt, style: &Style) {
                 text(p, Pos2::new(x + col_w / 2.0, r.top() + header_h / 2.0), Align2::CENTER_CENTER, name, lbl, MUTED);
                 p.line_segment([Pos2::new(x, r.top() + header_h * 0.7), Pos2::new(x, bottom)], Stroke::new(0.4 * s, GRID));
             }
-            text(p, Pos2::new(r.left(), r.top() + header_h / 2.0), Align2::LEFT_CENTER, &g.header, lbl, MUTED);
+            label_headers(p, r, &geo, g, r.top() + header_h / 2.0, lbl, MUTED);
         }
     }
     p.line_segment([Pos2::new(r.left(), grid.top()), Pos2::new(r.right(), grid.top())], strong);
@@ -1022,7 +1062,17 @@ pub fn draw_gantt(p: &Canvas, r: Rect, s: f32, g: &Gantt, style: &Style) {
 
     for (i, row) in g.tasks.iter().enumerate() {
         let cy = grid.top() + row_h * (i as f32 + 0.5);
-        text(p, Pos2::new(r.left(), cy), Align2::LEFT_CENTER, &row.label, lbl, INK);
+        if g.show_activity {
+            text(p, Pos2::new(r.left(), cy), Align2::LEFT_CENTER, &row.label, lbl, INK);
+        }
+        if g.show_responsible {
+            let w = geo.responsible_w - 6.0 * s;
+            text(p, Pos2::new(r.left() + geo.activity_w + 2.0 * s, cy), Align2::LEFT_CENTER, &fit_text(p, &row.responsible, lbl, w), lbl, INK);
+        }
+        if g.show_remark {
+            let w = geo.remark_w - 8.0 * s;
+            text(p, Pos2::new(grid.right() + 6.0 * s, cy), Align2::LEFT_CENTER, &fit_text(p, &row.remark, lbl, w), lbl, INK);
+        }
         if i + 1 < rows {
             p.line_segment([Pos2::new(r.left(), cy + row_h / 2.0), Pos2::new(r.right(), cy + row_h / 2.0)], Stroke::new(0.4 * s, GRID));
         }

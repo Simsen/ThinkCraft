@@ -566,24 +566,46 @@ pub fn deck_sheets(deck: &Deck, slides: &[usize], only: Option<u64>) -> Vec<Shee
                     sheets.push(Sheet { name: sheet_name(&title, &mut used), rows });
                 }
                 Kind::Gantt(g) => {
-                    let mut rows = vec![vec![
+                    let mut head = vec![
                         Cell::S("Activity".into()),
                         Cell::S("Start".into()),
                         Cell::S("End".into()),
                         Cell::S("Milestone".into()),
-                    ]];
+                    ];
+                    // the label columns the chart shows, after the dates
+                    if g.show_responsible {
+                        head.push(Cell::S(g.responsible_header.clone()));
+                    }
+                    if g.show_remark {
+                        head.push(Cell::S(g.remark_header.clone()));
+                    }
+                    let extra = |row: &Task| {
+                        let mut v = vec![];
+                        if g.show_responsible {
+                            v.push(Cell::S(row.responsible.clone()));
+                        }
+                        if g.show_remark {
+                            v.push(Cell::S(row.remark.clone()));
+                        }
+                        v
+                    };
+                    let mut rows = vec![head];
                     // one line per bar; an activity with several bars repeats its name
                     for row in &g.tasks {
                         if row.bars.is_empty() {
-                            rows.push(vec![Cell::S(row.label.clone())]);
+                            let mut v = vec![Cell::S(row.label.clone()), Cell::Empty, Cell::Empty, Cell::Empty];
+                            v.extend(extra(row));
+                            rows.push(v);
                         }
                         for t in &row.bars {
-                            rows.push(vec![
+                            let mut v = vec![
                                 Cell::S(row.label.clone()),
                                 Cell::N(t.start as f64),
                                 Cell::N(t.end as f64),
                                 Cell::S(if t.milestone { "yes".into() } else { String::new() }),
-                            ]);
+                            ];
+                            v.extend(extra(row));
+                            rows.push(v);
                         }
                     }
                     sheets.push(Sheet { name: sheet_name("Project plan", &mut used), rows });

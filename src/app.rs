@@ -7,8 +7,116 @@ use crate::office;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// What Copy puts on the clipboard: one Gantt bar or milestone, or whole elements.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+enum Clip {
+    GanttItem { row: usize, bar: Bar },
+    Elements(Vec<Element>),
+}
+
+/// The round menu around a Gantt chart's corner (right-click the chart).
+struct Radial {
+    id: u64,
+    slide: usize,
+    /// The empty timeline spot that was right-clicked: (chart id, activity, time).
+    cell: Option<(u64, usize, f32)>,
+    opened: u64,
+}
+
+/// The buttons of the round menu, clockwise from the top.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RadialCmd {
+    Delete,
+    SameWidth,
+    SameHeight,
+    Activity,
+    Responsible,
+    Remark,
+    Fit,
+    Calendar,
+    AddBar,
+    AddMilestone,
+    PasteHere,
+    Excel,
+    Datasheet,
+    Duplicate,
+}
+
+const RADIAL: [RadialCmd; 14] = [
+    RadialCmd::Delete,
+    RadialCmd::SameWidth,
+    RadialCmd::SameHeight,
+    RadialCmd::Activity,
+    RadialCmd::Responsible,
+    RadialCmd::Remark,
+    RadialCmd::Fit,
+    RadialCmd::Calendar,
+    RadialCmd::AddBar,
+    RadialCmd::AddMilestone,
+    RadialCmd::PasteHere,
+    RadialCmd::Excel,
+    RadialCmd::Datasheet,
+    RadialCmd::Duplicate,
+];
+
+/// The calendar window for a Gantt chart: which chart and which month is shown.
+struct CalendarDlg {
+    id: u64,
+    year: i32,
+    month: u32,
+}
+
+/// First line of ThinkCraft's clipboard text, so a paste can tell it from other text.
+const CLIP_MARK: &str = "ThinkCraft clipboard v1\n";
+
+impl Clip {
+    fn to_text(&self) -> String {
+        format!("{CLIP_MARK}{}", serde_json::to_string(self).unwrap_or_default())
+    }
+    fn from_text(text: &str) -> Option<Clip> {
+        serde_json::from_str(text.strip_prefix(CLIP_MARK)?).ok()
+    }
+}
+
+/// Puts a copy of `bar` into a Gantt chart and returns its (row, index).
+/// It goes into `row` (an empty chart gets a first activity), keeps its own dates unless
+/// `at` gives a new start, and lands last in the row so it is drawn on top and grabbed first.
+fn paste_bar(g: &mut Gantt, row: usize, mut bar: Bar, at: Option<f32>) -> (usize, usize) {
+    if g.tasks.is_empty() {
+        g.tasks.push(Task::new("New activity", vec![]));
+    }
+    let row = row.min(g.tasks.len() - 1);
+    let cols = g.columns() as f32;
+    let len = if bar.milestone { 0.0 } else { (bar.end - bar.start).max(0.0).min(cols) };
+    let start = match at {
+        Some(t) => (t / g.snap_step()).round() * g.snap_step(),
+        None => bar.start,
+    };
+    bar.start = start.clamp(0.0, (cols - len).max(0.0));
+    bar.end = bar.start + len;
+    g.tasks[row].bars.push(bar);
+    (row, g.tasks[row].bars.len() - 1)
+}
+
+/// Moves a bar by `dt` (in columns) and `drow` activities; returns its new (row, index).
+fn nudge_bar(g: &mut Gantt, row: usize, bi: usize, dt: f32, drow: i32) -> (usize, usize) {
+    let cols = g.columns() as f32;
+    let b = &mut g.tasks[row].bars[bi];
+    let len = (b.end - b.start).max(0.0);
+    b.start = (b.start + dt).clamp(0.0, (cols - len).max(0.0));
+    b.end = if b.milestone { b.start } else { b.start + len };
+    let target = (row as i32 + drow).clamp(0, g.tasks.len() as i32 - 1) as usize;
+    if target == row {
+        return (row, bi);
+    }
+    let moved = g.tasks[row].bars.remove(bi);
+    g.tasks[target].bars.push(moved);
+    (target, g.tasks[target].bars.len() - 1)
+}
 
 const ACCENT: Color32 = Color32::from_rgb(196, 84, 36);
 const PANEL_BG: Color32 = Color32::from_rgb(246, 246, 248);
@@ -121,6 +229,23 @@ enum Action {
     SelectAll,
     Front,
     Back,
+    /// Copy the selected Gantt bar, or the selected elements.
+    Copy,
+    Cut,
+    /// Paste what was copied. `text` is the clipboard text from Cmd+V (None: use the last copy);
+    /// `at` is a spot in a Gantt chart (chart id, activity, time) to paste a bar into.
+    Paste { text: Option<String>, at: Option<(u64, usize, f32)> },
+    /// Delete or duplicate the selected Gantt bar if there is one, otherwise the selected elements.
+    ItemDelete,
+    ItemDuplicate,
+    /// Add a bar or milestone to a Gantt chart at (chart id, activity, time).
+    GanttAdd { id: u64, row: usize, t: f32, milestone: bool },
+    /// Show or hide a Gantt label column: 0 activity, 1 responsible, 2 remark.
+    GanttColumn { id: u64, which: u8 },
+    /// Fit a Gantt chart's timeline to its bars.
+    GanttFit { id: u64 },
+    /// Open the calendar window for a Gantt chart.
+    GanttCalendar { id: u64 },
 }
 
 enum Drag {
@@ -238,6 +363,14 @@ pub struct ThinkCraft {
     elements_pos: Pos2,
     elements_opened_frame: u64,
     drag_label: Option<String>,
+    /// The single Gantt bar or milestone picked inside the selected chart: (chart id, row, bar).
+    gantt_sel: Option<(u64, usize, usize)>,
+    /// The last thing copied inside ThinkCraft.
+    clip: Option<Clip>,
+    /// Empty Gantt spot under the last right-click: (chart id, activity, time).
+    menu_cell: Option<(u64, usize, f32)>,
+    radial: Option<Radial>,
+    calendar_dlg: Option<CalendarDlg>,
 }
 
 impl ThinkCraft {
@@ -313,6 +446,116 @@ impl ThinkCraft {
             elements_pos: Pos2::new(62.0, 106.0),
             elements_opened_frame: 0,
             drag_label: None,
+            gantt_sel: None,
+            clip: None,
+            menu_cell: None,
+            radial: None,
+            calendar_dlg: None,
+        }
+    }
+
+    /// The selected Gantt bar, if it still exists: (chart id, row, bar).
+    fn gantt_item(&self) -> Option<(u64, usize, usize)> {
+        let (id, row, bi) = self.gantt_sel?;
+        if self.selected.as_slice() != [id] {
+            return None;
+        }
+        let el = self.deck.slides[self.current].elements.iter().find(|e| e.id == id)?;
+        let Kind::Gantt(g) = &el.kind else { return None };
+        (row < g.tasks.len() && bi < g.tasks[row].bars.len()).then_some((id, row, bi))
+    }
+
+    fn gantt_mut(&mut self, id: u64) -> Option<&mut Gantt> {
+        let cur = self.current;
+        match &mut self.deck.slides[cur].elements.iter_mut().find(|e| e.id == id)?.kind {
+            Kind::Gantt(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    /// "Design: bar" or "Go-live: milestone", for status messages.
+    fn item_name(&self, (id, row, bi): (u64, usize, usize)) -> String {
+        let el = self.deck.slides[self.current].elements.iter().find(|e| e.id == id);
+        match el.map(|e| &e.kind) {
+            Some(Kind::Gantt(g)) => {
+                let what = if g.tasks[row].bars[bi].milestone { "milestone" } else { "bar" };
+                format!("the {what} in {}", g.tasks[row].label)
+            }
+            _ => "the item".into(),
+        }
+    }
+
+    /// Copies the selected Gantt bar, or else the selected elements. Returns false if nothing was selected.
+    fn copy_selection(&mut self, ctx: &egui::Context) -> bool {
+        let clip = if let Some((id, row, bi)) = self.gantt_item() {
+            let Some(g) = self.gantt_mut(id) else { return false };
+            let bar = g.tasks[row].bars[bi].clone();
+            self.status = format!("Copied {}. Press Cmd+V to paste it, then drag it where it should go.", self.item_name((id, row, bi)));
+            Clip::GanttItem { row, bar }
+        } else if !self.selected.is_empty() {
+            let sel = self.selected.clone();
+            let els: Vec<Element> = self.deck.slides[self.current].elements.iter().filter(|e| sel.contains(&e.id)).cloned().collect();
+            self.status = format!("Copied {} element{}. Press Cmd+V to paste.", els.len(), if els.len() == 1 { "" } else { "s" });
+            Clip::Elements(els)
+        } else {
+            self.status = "Select something to copy: click a bar in a Gantt chart, or an element.".into();
+            return false;
+        };
+        ctx.copy_text(clip.to_text());
+        self.clip = Some(clip);
+        true
+    }
+
+    fn paste_clip(&mut self, clip: Clip, at: Option<(u64, usize, f32)>) {
+        match clip {
+            Clip::GanttItem { row, bar } => {
+                // into the spot right-clicked, else the selected bar's activity, else the copied bar's own activity
+                let slide = &self.deck.slides[self.current];
+                let chart = at.map(|a| a.0).or(self.gantt_item().map(|s| s.0)).or_else(|| {
+                    let sel: Vec<u64> = slide.elements.iter().filter(|e| self.selected.contains(&e.id) && matches!(e.kind, Kind::Gantt(_))).map(|e| e.id).collect();
+                    match sel.as_slice() {
+                        [id] => Some(*id),
+                        _ => {
+                            let all: Vec<u64> = slide.elements.iter().filter(|e| matches!(e.kind, Kind::Gantt(_))).map(|e| e.id).collect();
+                            (all.len() == 1).then(|| all[0])
+                        }
+                    }
+                });
+                let Some(id) = chart else {
+                    self.status = "Click a Gantt chart first, then paste the bar into it.".into();
+                    return;
+                };
+                let target_row = at.map(|a| a.1).or(self.gantt_item().map(|s| s.1)).unwrap_or(row);
+                let Some(g) = self.gantt_mut(id) else { return };
+                let (r, b) = paste_bar(g, target_row, bar, at.map(|a| a.2));
+                self.selected = vec![id];
+                self.gantt_sel = Some((id, r, b));
+                let name = self.item_name((id, r, b));
+                self.status = if at.is_some() {
+                    format!("Pasted {name}. Drag it or its ends to adjust.")
+                } else {
+                    format!("Pasted {name}, on top of where it was. Drag it, or use the arrow keys, to move it.")
+                };
+            }
+            Clip::Elements(els) => {
+                let cur = self.current;
+                let taken = |x: f32, y: f32, slide: &Slide| slide.elements.iter().any(|e| (e.x - x).abs() < 0.5 && (e.y - y).abs() < 0.5);
+                let mut off = 0.0;
+                while off < 400.0 && els.iter().any(|e| taken(e.x + off, e.y + off, &self.deck.slides[cur])) {
+                    off += 16.0;
+                }
+                self.selected.clear();
+                self.gantt_sel = None;
+                let n = els.len();
+                for mut e in els {
+                    e.id = self.deck.new_id();
+                    e.x += off;
+                    e.y += off;
+                    self.selected.push(e.id);
+                    self.deck.slides[cur].elements.push(e);
+                }
+                self.status = format!("Pasted {n} element{}.", if n == 1 { "" } else { "s" });
+            }
         }
     }
 
@@ -560,6 +803,103 @@ impl ThinkCraft {
                     self.slide().elements.push(e);
                 }
             }
+            Action::Copy => {
+                self.copy_selection(&ctx);
+            }
+            Action::Cut => {
+                if self.copy_selection(&ctx) {
+                    let status = self.status.replace("Copied", "Cut");
+                    self.run(Action::ItemDelete, ui);
+                    self.status = status;
+                }
+            }
+            Action::Paste { text, at } => {
+                let clip = match text {
+                    Some(t) => match Clip::from_text(&t) {
+                        Some(c) => c,
+                        None => {
+                            self.status = "The clipboard holds something from another app. ThinkCraft pastes bars and elements copied in ThinkCraft; use Paste from Excel… for data.".into();
+                            return;
+                        }
+                    },
+                    None => match self.clip.clone() {
+                        Some(c) => c,
+                        None => {
+                            self.status = "Nothing copied yet. Click a bar or an element and press Cmd+C first.".into();
+                            return;
+                        }
+                    },
+                };
+                self.clip = Some(clip.clone());
+                self.paste_clip(clip, at);
+            }
+            Action::ItemDelete => match self.gantt_item() {
+                Some((id, row, bi)) => {
+                    let name = self.item_name((id, row, bi));
+                    if let Some(g) = self.gantt_mut(id) {
+                        g.tasks[row].bars.remove(bi);
+                    }
+                    self.gantt_sel = None;
+                    self.status = format!("Deleted {name}.");
+                }
+                None => self.run(Action::Delete, ui),
+            },
+            Action::ItemDuplicate => match self.gantt_item() {
+                Some((id, row, bi)) => {
+                    if let Some(g) = self.gantt_mut(id) {
+                        let bar = g.tasks[row].bars[bi].clone();
+                        let (r, b) = paste_bar(g, row, bar, None);
+                        self.gantt_sel = Some((id, r, b));
+                        self.status = format!("Duplicated {}, on top of the original. Drag it, or use the arrow keys, to move it.", self.item_name((id, r, b)));
+                    }
+                }
+                None => self.run(Action::Duplicate, ui),
+            },
+            Action::GanttAdd { id, row, t, milestone } => {
+                if let Some(g) = self.gantt_mut(id) {
+                    let len = if milestone { 0.0 } else { 1.0 };
+                    let (r, b) = paste_bar(g, row, Bar { start: t, end: t + len, milestone, dashed: false, color: if milestone { 1 } else { 0 } }, Some(t));
+                    self.selected = vec![id];
+                    self.gantt_sel = Some((id, r, b));
+                    self.status = format!("Added {}. Drag it or its ends to adjust.", self.item_name((id, r, b)));
+                }
+            }
+            Action::GanttColumn { id, which } => {
+                if let Some(g) = self.gantt_mut(id) {
+                    let (flag, name) = match which {
+                        0 => (&mut g.show_activity, "activity"),
+                        1 => (&mut g.show_responsible, "responsible"),
+                        _ => (&mut g.show_remark, "remark"),
+                    };
+                    *flag = !*flag;
+                    let on = *flag;
+                    self.selected = vec![id];
+                    if on && which > 0 {
+                        self.show_datasheet = true;
+                    }
+                    self.status = if on && which > 0 {
+                        format!("Added the {name} label column. Fill it in the datasheet below.")
+                    } else if on {
+                        format!("Added the {name} label column.")
+                    } else {
+                        format!("Removed the {name} label column. Its text is kept and comes back when you add the column again.")
+                    };
+                }
+            }
+            Action::GanttFit { id } => {
+                if let Some(g) = self.gantt_mut(id) {
+                    let ok = g.fit_to_data();
+                    let span = if g.start.is_some() { format!("{} weeks", g.weeks) } else { format!("{} periods", g.periods.len()) };
+                    self.status = if ok { format!("The timeline now fits the bars: {span}.") } else { "There are no bars to fit the timeline to.".into() };
+                }
+            }
+            Action::GanttCalendar { id } => {
+                let start = self.gantt_mut(id).and_then(|g| g.start);
+                match start {
+                    Some([y, m, _]) => self.calendar_dlg = Some(CalendarDlg { id, year: y, month: m.clamp(1, 12) as u32 }),
+                    None => self.status = "The calendar is for timelines in calendar weeks. Switch the chart to Calendar weeks first.".into(),
+                }
+            }
             Action::Undo => {
                 if let Some(d) = self.undo.pop() {
                     self.redo.push(self.deck.clone());
@@ -652,8 +992,25 @@ impl ThinkCraft {
             Kind::Gantt(g) => {
                 let rows: Vec<Vec<&str>> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| l.split(['\t', ';', ',']).collect()).collect();
                 let mut tasks: Vec<Task> = vec![];
+                // optional label columns after the dates, found by their heading
+                let find = |names: [&str; 2]| {
+                    rows.first().and_then(|h| h.iter().skip(4).position(|c| names.iter().any(|n| c.trim().eq_ignore_ascii_case(n))).map(|i| i + 4))
+                };
+                let resp_col = find([g.responsible_header.as_str(), "Responsible"]);
+                let remark_col = find([g.remark_header.as_str(), "Remark"]);
                 for r in rows.iter().skip(1) {
                     let label = r.first().map(|s| s.trim().to_string()).unwrap_or_default();
+                    let cell = |c: Option<usize>| c.and_then(|c| r.get(c)).map(|v| v.trim().to_string()).unwrap_or_default();
+                    let (responsible, remark) = (cell(resp_col), cell(remark_col));
+                    let has_dates = r.get(1).map(|v| !v.trim().is_empty()).unwrap_or(false);
+                    if !has_dates {
+                        // an activity without bars
+                        let mut t = Task::new(&label, vec![]);
+                        t.responsible = responsible;
+                        t.remark = remark;
+                        tasks.push(t);
+                        continue;
+                    }
                     let start = r.get(1).map(|v| parse_number(v) as f32).unwrap_or(0.0);
                     let end = r.get(2).map(|v| parse_number(v) as f32).unwrap_or(start);
                     let milestone = r.get(3).map(|v| !v.trim().is_empty()).unwrap_or(false) || (end - start).abs() < 1e-6;
@@ -661,13 +1018,20 @@ impl ThinkCraft {
                     // lines with the same activity name in a row share one activity
                     match tasks.last_mut() {
                         Some(t) if t.label == label => t.bars.push(bar),
-                        _ => tasks.push(Task { label, bars: vec![bar] }),
+                        _ => {
+                            let mut t = Task::new(&label, vec![bar]);
+                            t.responsible = responsible;
+                            t.remark = remark;
+                            tasks.push(t);
+                        }
                     }
                 }
                 if tasks.is_empty() {
-                    self.status = "Paste rows of: activity, start, end, milestone.".into();
+                    self.status = "Paste rows of: activity, start, end, milestone (and optionally Responsible and Remark columns).".into();
                 } else {
                     self.status = format!("Loaded {} activities from {from}.", tasks.len());
+                    g.show_responsible |= resp_col.is_some();
+                    g.show_remark |= remark_col.is_some();
                     g.tasks = tasks;
                 }
             }
@@ -1304,6 +1668,10 @@ impl ThinkCraft {
                 self.drag = Drag::Resize { id, handle: h, orig: Rect::from_min_size(Pos2::new(el.x, el.y), Vec2::new(el.w, el.h)), start: xf.to_slide(press) };
             } else if let Some((id, h)) = gantt {
                 self.selected = vec![id];
+                self.gantt_sel = match h {
+                    GanttHit::Bar(row, bar, _) => Some((id, row, bar)),
+                    GanttHit::Today => None,
+                };
                 let el = slide.elements.iter().find(|e| e.id == id).unwrap();
                 self.drag = match (h, &el.kind) {
                     (GanttHit::Today, _) => Drag::GanttToday { id },
@@ -1315,6 +1683,7 @@ impl ThinkCraft {
                     _ => Drag::None,
                 };
             } else if let Some(id) = hit(slide, press) {
+                self.gantt_sel = None;
                 if !self.selected.contains(&id) {
                     if shift {
                         self.selected.push(id);
@@ -1330,6 +1699,7 @@ impl ThinkCraft {
                     .collect();
                 self.drag = Drag::Move { start: xf.to_slide(press), orig };
             } else {
+                self.gantt_sel = None;
                 if !shift {
                     self.selected.clear();
                 }
@@ -1399,6 +1769,7 @@ impl ThinkCraft {
                                     format!("{label}: {:.2} – {:.2}", t.start, t.end)
                                 });
                                 self.drag = Drag::GanttBar { id, row, bar: bi, part, orig: (s0, e0), grab_t };
+                                self.gantt_sel = Some((id, row, bi));
                             }
                         }
                     }
@@ -1512,18 +1883,32 @@ impl ThinkCraft {
 
         if resp.clicked() {
             if let Some(p) = pointer {
-                match hit(&self.deck.slides[self.current], p) {
-                    Some(id) if shift => {
-                        if let Some(k) = self.selected.iter().position(|s| *s == id) {
-                            self.selected.remove(k);
-                        } else {
-                            self.selected.push(id);
+                // a click on a Gantt bar or milestone picks that item inside the chart
+                let picked = match gantt_at(&self.deck.slides[self.current], p) {
+                    Some((id, GanttHit::Bar(row, bar, _))) if !shift => Some((id, row, bar)),
+                    _ => None,
+                };
+                self.gantt_sel = picked;
+                if let Some(item) = picked {
+                    self.selected = vec![item.0];
+                    self.status = format!(
+                        "Picked {}. Cmd+C copies it, Cmd+V pastes, Delete removes it, arrows move it. Right-click for more.",
+                        self.item_name(item)
+                    );
+                } else {
+                    match hit(&self.deck.slides[self.current], p) {
+                        Some(id) if shift => {
+                            if let Some(k) = self.selected.iter().position(|s| *s == id) {
+                                self.selected.remove(k);
+                            } else {
+                                self.selected.push(id);
+                            }
                         }
-                    }
-                    Some(id) => self.selected = vec![id],
-                    None => {
-                        if !shift {
-                            self.selected.clear()
+                        Some(id) => self.selected = vec![id],
+                        None => {
+                            if !shift {
+                                self.selected.clear()
+                            }
                         }
                     }
                 }
@@ -1550,6 +1935,7 @@ impl ThinkCraft {
                             let start = ((geo.t(p.x) / g.snap_step()).round() * g.snap_step()).clamp(0.0, (cols - len).max(0.0));
                             g.tasks[row].bars.push(Bar { start, end: start + len, milestone: false, dashed: false, color: 0 });
                             added = Some((el.id, g.tasks[row].label.clone()));
+                            self.gantt_sel = Some((el.id, row, g.tasks[row].bars.len() - 1));
                         }
                         break;
                     }
@@ -1560,20 +1946,100 @@ impl ThinkCraft {
                 }
             }
         }
-        resp.context_menu(|ui| {
-            if let Some(p) = ui.ctx().input(|i| i.pointer.press_origin()) {
-                if let Some(id) = hit(&self.deck.slides[self.current], p) {
-                    if !self.selected.contains(&id) {
+        // right-click: pick what is under the pointer, once, when the menu opens
+        if resp.secondary_clicked() {
+            self.menu_cell = None;
+            if let Some(p) = pointer {
+                let slide = &self.deck.slides[self.current];
+                match gantt_at(slide, p) {
+                    Some((id, GanttHit::Bar(row, bar, _))) => {
                         self.selected = vec![id];
+                        self.gantt_sel = Some((id, row, bar));
+                    }
+                    _ => {
+                        self.gantt_sel = None;
+                        if let Some(id) = hit(slide, p) {
+                            if !self.selected.contains(&id) {
+                                self.selected = vec![id];
+                            }
+                        }
+                        // an empty spot inside a Gantt timeline: offer to paste or add there
+                        for el in slide.elements.iter().rev() {
+                            if !xf.el_rect(el).contains(p) {
+                                continue;
+                            }
+                            if let Kind::Gantt(g) = &el.kind {
+                                let geo = draw::GanttGeo::new(xf.el_rect(el), xf.scale, g);
+                                if p.x >= geo.grid.left() && p.x <= geo.grid.right() && p.y >= geo.grid.top() && p.y <= geo.bottom && !g.tasks.is_empty() {
+                                    self.menu_cell = Some((el.id, geo.row_at(p.y, g.tasks.len()), geo.t(p.x)));
+                                }
+                            }
+                            break;
+                        }
+                        // a Gantt chart gets the round menu around its corner
+                        let gantt_id = hit(slide, p).filter(|id| slide.elements.iter().any(|e| e.id == *id && matches!(e.kind, Kind::Gantt(_))));
+                        if let Some(id) = gantt_id {
+                            self.radial = Some(Radial { id, slide: self.current, cell: self.menu_cell, opened: self.frame });
+                            egui::Popup::close_all(ui.ctx());
+                        }
                     }
                 }
             }
+        }
+        if self.radial.is_none() {
+            self.list_menu(&resp);
+        }
+        self.radial_menu(ui.ctx(), &xf);
+
+        // ---- overlays
+        self.overlays(&painter, &xf, pointer, slide_rect);
+    }
+
+    /// The ordinary right-click menu (elements, and a picked Gantt bar).
+    fn list_menu(&mut self, resp: &egui::Response) {
+        resp.context_menu(|ui| {
             let has = !self.selected.is_empty();
-            if ui.add_enabled(has, egui::Button::new("Duplicate")).clicked() {
+            let can_paste = self.clip.is_some();
+            if let Some(item) = self.gantt_item() {
+                let name = self.item_name(item);
+                ui.label(RichText::new(name[..1].to_uppercase() + &name[1..]).small().color(Color32::GRAY));
+                let mut entry = |ui: &mut egui::Ui, label: &str, keys: &str, a: Action| {
+                    if ui.add(egui::Button::new(label).shortcut_text(keys)).clicked() {
+                        self.actions.push(a);
+                        ui.close();
+                    }
+                };
+                entry(ui, "Copy", "⌘C", Action::Copy);
+                entry(ui, "Cut", "⌘X", Action::Cut);
+                if can_paste {
+                    entry(ui, "Paste", "⌘V", Action::Paste { text: None, at: None });
+                }
+                entry(ui, "Duplicate", "⌘D", Action::ItemDuplicate);
+                entry(ui, "Delete", "⌫", Action::ItemDelete);
+                ui.separator();
+                if ui.button("Copy slide as picture").clicked() {
+                    self.actions.push(Action::CopyPicture);
+                    ui.close();
+                }
+                return;
+            }
+            if ui.add_enabled(has, egui::Button::new("Copy").shortcut_text("⌘C")).clicked() {
+                self.actions.push(Action::Copy);
+                ui.close();
+            }
+            if ui.add_enabled(has, egui::Button::new("Cut").shortcut_text("⌘X")).clicked() {
+                self.actions.push(Action::Cut);
+                ui.close();
+            }
+            if ui.add_enabled(can_paste, egui::Button::new("Paste").shortcut_text("⌘V")).clicked() {
+                self.actions.push(Action::Paste { text: None, at: None });
+                ui.close();
+            }
+            if ui.add_enabled(has, egui::Button::new("Duplicate").shortcut_text("⌘D")).clicked() {
                 self.actions.push(Action::Duplicate);
                 ui.close();
             }
-            if ui.add_enabled(has, egui::Button::new("Delete")).clicked() {
+            if ui.add_enabled(has, egui::Button::new("Delete").shortcut_text("⌫")).clicked() {
                 self.actions.push(Action::Delete);
                 ui.close();
             }
@@ -1591,8 +2057,10 @@ impl ThinkCraft {
                 ui.close();
             }
         });
+    }
 
-        // ---- overlays
+    /// Selection outlines, the picked Gantt bar, snap guides, the marquee and the drag label.
+    fn overlays(&mut self, painter: &egui::Painter, xf: &Xf, pointer: Option<Pos2>, slide_rect: Rect) {
         if let (Some(label), Some(p)) = (&self.drag_label, pointer) {
             let galley = painter.layout_no_wrap(label.clone(), FontId::proportional(12.0), Color32::WHITE);
             let r = Rect::from_min_size(p + Vec2::new(14.0, -30.0), galley.size() + Vec2::new(12.0, 6.0));
@@ -1620,6 +2088,23 @@ impl ThinkCraft {
                     );
                 }
             }
+            // the picked Gantt bar or milestone
+            if let Some((id, row, bi)) = self.gantt_item() {
+                if let Some(el) = self.deck.slides[self.current].elements.iter().find(|e| e.id == id) {
+                    if let Kind::Gantt(g) = &el.kind {
+                        let geo = draw::GanttGeo::new(xf.el_rect(el), xf.scale, g);
+                        let r = geo.bar_rect(&g.tasks[row].bars[bi], row).expand(3.0);
+                        painter.rect_stroke(r, 2.0, Stroke::new(1.6, ACCENT), StrokeKind::Outside);
+                        if !g.tasks[row].bars[bi].milestone {
+                            for x in [r.left(), r.right()] {
+                                let hr = Rect::from_center_size(Pos2::new(x, r.center().y), Vec2::new(5.0, 9.0));
+                                painter.rect_filled(hr, 1.0, Color32::WHITE);
+                                painter.rect_stroke(hr, 1.0, Stroke::new(1.2, ACCENT), StrokeKind::Inside);
+                            }
+                        }
+                    }
+                }
+            }
             for (vertical, at) in &self.guides {
                 let (a, b) = if *vertical { (xf.pos(*at, 0.0), xf.pos(*at, SLIDE_H)) } else { (xf.pos(0.0, *at), xf.pos(SLIDE_W, *at)) };
                 painter.add(egui::Shape::dashed_line(&[a, b], Stroke::new(1.0, GUIDE), 4.0, 3.0));
@@ -1639,6 +2124,226 @@ impl ThinkCraft {
                 );
             }
         }
+    }
+
+    /// The round menu: buttons on a circle around the Gantt chart's top-right corner,
+    /// each with a tip when hovered. Opened by right-clicking the chart.
+    fn radial_menu(&mut self, ctx: &egui::Context, xf: &Xf) {
+        let Some(rad) = &self.radial else { return };
+        let (id, cell, opened) = (rad.id, rad.cell, rad.opened);
+        let el = (rad.slide == self.current).then(|| self.deck.slides[self.current].elements.iter().find(|e| e.id == id)).flatten();
+        let Some(Kind::Gantt(g)) = el.map(|e| &e.kind) else {
+            self.radial = None;
+            return;
+        };
+        let corner_raw = xf.el_rect(el.unwrap()).right_top();
+        let (bubble, radius) = (16.0, 84.0);
+        let screen = ctx.content_rect().shrink(radius + bubble + 4.0);
+        let corner = Pos2::new(corner_raw.x.clamp(screen.left(), screen.right().max(screen.left())), corner_raw.y.clamp(screen.top(), screen.bottom().max(screen.top())));
+        let several = self.selected.len() > 1;
+        let bar_copied = matches!(self.clip, Some(Clip::GanttItem { .. }));
+        let (calendar, act, resp, rem, datasheet) = (g.start.is_some(), g.show_activity, g.show_responsible, g.show_remark, self.show_datasheet);
+        let info = |c: RadialCmd| -> (String, bool, bool) {
+            // (tip, enabled, column shown)
+            let col = |on: bool, name: &str| (format!("{} {name} label column", if on { "Remove" } else { "Add" }), true, on);
+            match c {
+                RadialCmd::Delete => ("Delete chart".into(), true, false),
+                RadialCmd::SameWidth => (if several { "Same width".into() } else { "Same width (select several elements first)".into() }, several, false),
+                RadialCmd::SameHeight => (if several { "Same height".into() } else { "Same height (select several elements first)".into() }, several, false),
+                RadialCmd::Activity => col(act, "activity"),
+                RadialCmd::Responsible => col(resp, "responsible"),
+                RadialCmd::Remark => col(rem, "remark"),
+                RadialCmd::Fit => ("Fit scale to data".into(), true, false),
+                RadialCmd::Calendar => (if calendar { "Open calendar".into() } else { "Open calendar (calendar weeks only)".into() }, calendar, false),
+                RadialCmd::AddBar => (if cell.is_some() { "Add bar here".into() } else { "Add bar here (right-click inside the timeline)".into() }, cell.is_some(), false),
+                RadialCmd::AddMilestone => (if cell.is_some() { "Add milestone here".into() } else { "Add milestone here (right-click inside the timeline)".into() }, cell.is_some(), false),
+                RadialCmd::PasteHere => (if bar_copied { "Paste bar here".into() } else { "Paste bar here (copy a bar first)".into() }, bar_copied, false),
+                RadialCmd::Excel => ("Open data in Excel".into(), true, false),
+                RadialCmd::Datasheet => (if datasheet { "Hide datasheet".into() } else { "Show datasheet".into() }, true, datasheet),
+                RadialCmd::Duplicate => ("Duplicate chart".into(), true, false),
+            }
+        };
+        let n = RADIAL.len() as f32;
+        let centers: Vec<Pos2> = (0..RADIAL.len())
+            .map(|i| {
+                let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / n;
+                corner + Vec2::new(a.cos(), a.sin()) * radius
+            })
+            .collect();
+        let pointer = ctx.pointer_hover_pos();
+        let hovered = pointer.and_then(|p| centers.iter().position(|c| c.distance(p) <= bubble + 1.0));
+        let bounds = Rect::from_center_size(corner, Vec2::splat(2.0 * (radius + bubble + 2.0)));
+        let mut picked = None;
+        egui::Area::new(egui::Id::unique("gantt_radial")).order(egui::Order::Foreground).fixed_pos(bounds.min).show(ctx, |ui| {
+            let (_, _) = ui.allocate_exact_size(bounds.size(), Sense::click());
+            let painter = ui.painter();
+            if let Some(h) = hovered {
+                // a soft wedge from the corner to the hovered button
+                let c = centers[h];
+                let side = (c - corner).normalized().rot90() * bubble * 0.9;
+                painter.add(egui::Shape::convex_polygon(vec![corner, c + side, c - side], Color32::from_black_alpha(28), Stroke::NONE));
+            }
+            for (i, cmd) in RADIAL.iter().enumerate() {
+                let (_, enabled, on) = info(*cmd);
+                let c = centers[i];
+                let fill = if hovered == Some(i) && enabled { Color32::from_rgb(198, 199, 204) } else { Color32::from_rgb(236, 236, 239) };
+                painter.circle_filled(c + Vec2::new(0.0, 1.0), bubble, Color32::from_black_alpha(30));
+                painter.circle_filled(c, bubble, fill);
+                radial_glyph(painter, c, *cmd, on, enabled);
+            }
+            if let Some(h) = hovered {
+                let (tip, _, _) = info(RADIAL[h]);
+                let galley = painter.layout_no_wrap(tip, FontId::proportional(13.0), Color32::WHITE);
+                let c = centers[h];
+                let out = (c - corner).normalized();
+                let at = c + out * (bubble + 8.0) + Vec2::new(if out.x < -0.3 { -galley.size().x - 12.0 } else { 0.0 }, 6.0);
+                let r = Rect::from_min_size(at, galley.size() + Vec2::new(12.0, 8.0));
+                painter.rect_filled(r.translate(Vec2::new(0.0, 2.0)), 4.0, Color32::from_black_alpha(40));
+                painter.rect_filled(r, 4.0, Color32::from_rgb(32, 33, 38));
+                painter.galley(r.min + Vec2::new(6.0, 4.0), galley, Color32::WHITE);
+            }
+            if self.frame > opened + 1 {
+                if let Some(h) = hovered.filter(|_| ui.input(|i| i.pointer.primary_clicked())) {
+                    picked = Some(RADIAL[h]);
+                }
+            }
+        });
+        let outside_press = self.frame > opened + 1 && ctx.input(|i| i.pointer.any_pressed()) && hovered.is_none();
+        if outside_press || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.radial = None;
+        }
+        let Some(cmd) = picked else { return };
+        if !info(cmd).1 {
+            return;
+        }
+        self.radial = None;
+        self.gantt_sel = None;
+        let action = match cmd {
+            RadialCmd::Delete => Action::Delete,
+            RadialCmd::SameWidth => Action::Align(AlignOp::SameWidth),
+            RadialCmd::SameHeight => Action::Align(AlignOp::SameHeight),
+            RadialCmd::Activity => Action::GanttColumn { id, which: 0 },
+            RadialCmd::Responsible => Action::GanttColumn { id, which: 1 },
+            RadialCmd::Remark => Action::GanttColumn { id, which: 2 },
+            RadialCmd::Fit => Action::GanttFit { id },
+            RadialCmd::Calendar => Action::GanttCalendar { id },
+            RadialCmd::AddBar | RadialCmd::AddMilestone => {
+                let (_, row, t) = cell.unwrap_or((id, 0, 0.0));
+                Action::GanttAdd { id, row, t, milestone: cmd == RadialCmd::AddMilestone }
+            }
+            RadialCmd::PasteHere => {
+                self.selected = vec![id];
+                Action::Paste { text: None, at: cell }
+            }
+            RadialCmd::Excel => Action::OpenExcel,
+            RadialCmd::Datasheet => {
+                self.show_datasheet = !self.show_datasheet;
+                return;
+            }
+            RadialCmd::Duplicate => Action::Duplicate,
+        };
+        self.actions.push(action);
+    }
+
+    /// The calendar window: pick the week the timeline starts on; bars keep their dates.
+    fn calendar_window(&mut self, ctx: &egui::Context) {
+        let Some(dlg) = &self.calendar_dlg else { return };
+        let (id, mut year, mut month) = (dlg.id, dlg.year, dlg.month);
+        let Some(g) = self.gantt_mut(id) else {
+            self.calendar_dlg = None;
+            return;
+        };
+        let Some([sy, sm, sd]) = g.start else {
+            self.calendar_dlg = None;
+            return;
+        };
+        let start = days_from_civil(sy, sm.max(1) as u32, sd.max(1) as u32);
+        let mut weeks = g.weeks.max(1);
+        let end = start + 7 * weeks as i64 - 1;
+        let today = today_days();
+        let mut open = true;
+        let mut new_start = None;
+        let mut fit = false;
+        egui::Window::new("Timeline calendar").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("‹").on_hover_text("Previous month").clicked() {
+                    (year, month) = if month == 1 { (year - 1, 12) } else { (year, month - 1) };
+                }
+                ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new(format!("{} {year}", FULL_MONTHS[(month as usize + 11) % 12])).strong()));
+                if ui.button("›").on_hover_text("Next month").clicked() {
+                    (year, month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+                }
+            });
+            let first = days_from_civil(year, month, 1);
+            let monday = first - weekday(first) as i64;
+            egui::Grid::new("cal").spacing([2.0, 2.0]).show(ui, |ui| {
+                ui.label(RichText::new("Wk").color(Color32::GRAY));
+                for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+                    ui.add_sized([26.0, 16.0], egui::Label::new(RichText::new(d).color(Color32::GRAY)));
+                }
+                ui.end_row();
+                for w in 0..6 {
+                    let row_start = monday + 7 * w;
+                    ui.label(RichText::new(format!("{:02}", iso_week(row_start).1)).color(Color32::GRAY));
+                    for k in 0..7 {
+                        let day = row_start + k;
+                        let (_, m, dd) = civil_from_days(day);
+                        let inside = day >= start && day <= end;
+                        let first_week = day >= start && day < start + 7;
+                        let fill = if first_week {
+                            ACCENT
+                        } else if inside {
+                            Color32::from_rgb(250, 222, 208)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let mut txt = RichText::new(dd.to_string());
+                        txt = if first_week {
+                            txt.color(Color32::WHITE)
+                        } else if m != month {
+                            txt.color(Color32::from_gray(170))
+                        } else {
+                            txt
+                        };
+                        if day == today {
+                            txt = txt.underline();
+                        }
+                        if ui.add_sized([26.0, 20.0], egui::Button::new(txt).fill(fill)).on_hover_text("Start the timeline in this week").clicked() {
+                            new_start = Some(day);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(4.0);
+            let (ey, em, ed) = civil_from_days(end);
+            ui.horizontal(|ui| {
+                ui.label("Weeks");
+                ui.add(egui::DragValue::new(&mut weeks).range(1..=104));
+                ui.label(RichText::new(format!("{sd:02}.{sm:02}.{sy} – {ed:02}.{em:02}.{ey}")).color(Color32::GRAY));
+            });
+            ui.label(RichText::new("Click a day to start the timeline in its week. Bars keep their dates.").color(Color32::GRAY));
+            ui.horizontal(|ui| {
+                if ui.button("Fit scale to data").clicked() {
+                    fit = true;
+                }
+                if ui.button("Today's week").clicked() {
+                    new_start = Some(today);
+                }
+            });
+        });
+        let Some(g) = self.gantt_mut(id) else { return };
+        g.weeks = weeks;
+        if let Some(day) = new_start {
+            g.set_start_keep_dates(day);
+        }
+        if fit {
+            g.fit_to_data();
+        }
+        if let Some([y, m, _]) = (new_start.is_some() || fit).then_some(g.start).flatten() {
+            (year, month) = (y, m as u32);
+        }
+        self.calendar_dlg = open.then_some(CalendarDlg { id, year, month });
     }
 
     fn props_panel(&mut self, ui: &mut egui::Ui) {
@@ -1792,8 +2497,19 @@ impl ThinkCraft {
                 c.normalize();
             }
             Kind::Gantt(g) => {
-                ui.label("First column heading");
-                ui.add(egui::TextEdit::singleline(&mut g.header).desired_width(f32::INFINITY));
+                ui.label(RichText::new("Label columns").strong());
+                egui::Grid::new("label_cols").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+                    ui.checkbox(&mut g.show_activity, "Activity").on_hover_text("Activity names, left of the timeline");
+                    ui.add(egui::TextEdit::singleline(&mut g.header).desired_width(f32::INFINITY).hint_text("Heading"));
+                    ui.end_row();
+                    ui.checkbox(&mut g.show_responsible, "Responsible").on_hover_text("Who is responsible, next to the activity names");
+                    ui.add(egui::TextEdit::singleline(&mut g.responsible_header).desired_width(f32::INFINITY).hint_text("Heading"));
+                    ui.end_row();
+                    ui.checkbox(&mut g.show_remark, "Remark").on_hover_text("A remark per activity, right of the timeline");
+                    ui.add(egui::TextEdit::singleline(&mut g.remark_header).desired_width(f32::INFINITY).hint_text("Heading"));
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
                 let mut calendar = g.start.is_some();
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut calendar, true, "Calendar weeks");
@@ -1873,7 +2589,7 @@ impl ThinkCraft {
                         g.today = if has_today { Some(t) } else { None };
                     });
                 }
-                ui.label(RichText::new("On the slide: drag a bar to move it in time, or up/down into another activity (an activity can hold several bars and milestones). Drag a bar's end to make it longer or shorter. Double-click an empty spot in a row to add a bar. Drag the date line left or right. Hold Option to move freely (no snapping to days).").color(Color32::from_rgb(90, 92, 100)));
+                ui.label(RichText::new("On the slide: drag a bar to move it in time, or up/down into another activity (an activity can hold several bars and milestones). Drag a bar's end to make it longer or shorter. Double-click an empty spot in a row to add a bar. Drag the date line left or right. Hold Option to move freely (no snapping to days). Click a bar or milestone to pick it: Cmd+C copies it and Cmd+V pastes the copy on top, ready to drag; arrow keys move it; Delete removes it. Right-click a bar for Copy, Cut, Paste and Delete. Right-click the chart for the round menu: label columns (activity, responsible, remark), fit scale to data, calendar, add or paste a bar there, and more.").color(Color32::from_rgb(90, 92, 100)));
                 ui.label("Names and exact numbers are in the datasheet below.");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Datasheet").clicked() {
@@ -2131,8 +2847,15 @@ impl ThinkCraft {
                 let maxp = g.columns() as f32;
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     egui::Grid::new("gsheet").striped(true).spacing([6.0, 2.0]).show(ui, |ui| {
+                        let (show_resp, show_remark) = (g.show_responsible, g.show_remark);
                         for h in ["Activity", "Start", "End", "Milestone", "Dashed", "Colour", ""] {
                             ui.label(RichText::new(h).strong());
+                        }
+                        if show_resp {
+                            ui.label(RichText::new(&g.responsible_header).strong());
+                        }
+                        if show_remark {
+                            ui.label(RichText::new(&g.remark_header).strong());
                         }
                         ui.end_row();
                         for (i, task) in g.tasks.iter_mut().enumerate() {
@@ -2158,6 +2881,12 @@ impl ThinkCraft {
                                     remove_row = Some(i);
                                 }
                             });
+                            if show_resp {
+                                ui.add_sized([120.0, 20.0], egui::TextEdit::singleline(&mut task.responsible));
+                            }
+                            if show_remark {
+                                ui.add_sized([160.0, 20.0], egui::TextEdit::singleline(&mut task.remark));
+                            }
                             ui.end_row();
                             // one line per bar or milestone
                             for (bi, t) in task.bars.iter_mut().enumerate() {
@@ -2268,16 +2997,58 @@ impl ThinkCraft {
             self.actions.push(Action::Save);
         }
         if cmd && pressed(Key::D) {
-            self.actions.push(Action::Duplicate);
+            self.actions.push(Action::ItemDuplicate);
         }
         if cmd && pressed(Key::A) {
             self.actions.push(Action::SelectAll);
         }
+        // Cmd+C, Cmd+X and Cmd+V arrive as clipboard events rather than key presses
+        for ev in ctx.input(|i| i.events.clone()) {
+            match ev {
+                egui::Event::Copy => self.actions.push(Action::Copy),
+                egui::Event::Cut => self.actions.push(Action::Cut),
+                egui::Event::Paste(text) => self.actions.push(Action::Paste { text: Some(text), at: None }),
+                egui::Event::PasteImage(_) => self.actions.push(Action::Paste { text: None, at: None }),
+                _ => {}
+            }
+        }
         if pressed(Key::Delete) || pressed(Key::Backspace) {
-            self.actions.push(Action::Delete);
+            self.actions.push(Action::ItemDelete);
         }
         if pressed(Key::Escape) {
-            self.selected.clear();
+            if self.gantt_item().is_some() {
+                self.gantt_sel = None;
+            } else {
+                self.selected.clear();
+            }
+        }
+        // arrows move a picked Gantt bar: left/right by a day (Shift: a week), up/down to the next activity
+        if let Some((id, row, bi)) = self.gantt_item() {
+            let mut dt = 0.0;
+            let mut drow = 0;
+            if pressed(Key::ArrowLeft) {
+                dt -= 1.0;
+            }
+            if pressed(Key::ArrowRight) {
+                dt += 1.0;
+            }
+            if pressed(Key::ArrowUp) {
+                drow -= 1;
+            }
+            if pressed(Key::ArrowDown) {
+                drow += 1;
+            }
+            if dt != 0.0 || drow != 0 {
+                if let Some(g) = self.gantt_mut(id) {
+                    // Shift: a whole week (or period)
+                    let step = if shift { 1.0 } else { g.snap_step() };
+                    let (r, b) = nudge_bar(g, row, bi, dt * step, drow);
+                    let status = format!("{}: {}", g.tasks[r].label, g.date_label(g.tasks[r].bars[b].start));
+                    self.gantt_sel = Some((id, r, b));
+                    self.status = status;
+                }
+            }
+            return;
         }
         let step = if shift { 10.0 } else { 1.0 };
         let mut d = Vec2::ZERO;
@@ -2430,6 +3201,7 @@ impl eframe::App for ThinkCraft {
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
 
         self.paste_window(&ctx);
+        self.calendar_window(&ctx);
         self.elements_popup(&ctx);
         if self.about {
             egui::Window::new("About ThinkCraft").open(&mut self.about).collapsible(false).resizable(false).show(&ctx, |ui| {
@@ -2454,6 +3226,7 @@ impl eframe::App for ThinkCraft {
         // keep the selection valid
         let ids: Vec<u64> = self.deck.slides[self.current.min(self.deck.slides.len() - 1)].elements.iter().map(|e| e.id).collect();
         self.selected.retain(|s| ids.contains(s));
+        self.gantt_sel = self.gantt_item();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2470,6 +3243,150 @@ impl eframe::App for ThinkCraft {
 }
 
 // ---------------------------------------------------------------------------
+
+const FULL_MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/// The little picture on a round-menu button, centred on `c`. `on` marks a column (or the
+/// datasheet) that is shown now, so the button removes it.
+fn radial_glyph(p: &egui::Painter, c: Pos2, cmd: RadialCmd, on: bool, enabled: bool) {
+    let fade = |col: Color32| if enabled { col } else { col.gamma_multiply(0.35) };
+    let ink = fade(Color32::from_rgb(78, 80, 88));
+    let light = fade(Color32::from_rgb(150, 152, 160));
+    let red = fade(Color32::from_rgb(214, 36, 56));
+    let green = fade(Color32::from_rgb(34, 132, 74));
+    let blue = fade(Color32::from_rgb(32, 74, 140));
+    let thin = Stroke::new(1.2, ink);
+    let v = Vec2::new;
+    let letter = |at: Pos2, s: &str, col: Color32, size: f32| {
+        p.text(at, Align2::CENTER_CENTER, s, FontId::proportional(size), col);
+    };
+    // small round badge: × to remove, + to add
+    let badge = |remove: bool| {
+        let b = c + v(7.5, 7.5);
+        p.circle_filled(b, 4.6, if remove { ink } else { green });
+        let k = 2.2;
+        let st = Stroke::new(1.3, Color32::WHITE);
+        if remove {
+            p.line_segment([b + v(-k, -k), b + v(k, k)], st);
+            p.line_segment([b + v(-k, k), b + v(k, -k)], st);
+        } else {
+            p.line_segment([b + v(-k, 0.0), b + v(k, 0.0)], st);
+            p.line_segment([b + v(0.0, -k), b + v(0.0, k)], st);
+        }
+    };
+    let arrow2 = |a: Pos2, b: Pos2| {
+        p.line_segment([a, b], thin);
+        let d = (b - a).normalized() * 3.0;
+        let n = d.rot90();
+        p.line_segment([a, a + d + n], thin);
+        p.line_segment([a, a + d - n], thin);
+        p.line_segment([b, b - d + n], thin);
+        p.line_segment([b, b - d - n], thin);
+    };
+    match cmd {
+        RadialCmd::Delete => {
+            let st = Stroke::new(3.0, red);
+            p.line_segment([c + v(-6.0, -6.0), c + v(6.0, 6.0)], st);
+            p.line_segment([c + v(-6.0, 6.0), c + v(6.0, -6.0)], st);
+        }
+        RadialCmd::Duplicate => {
+            p.rect_stroke(Rect::from_min_size(c + v(-7.0, -7.0), v(9.0, 9.0)), 1.0, thin, StrokeKind::Middle);
+            p.rect_filled(Rect::from_min_size(c + v(-2.0, -2.0), v(9.0, 9.0)), 1.0, Color32::from_rgb(236, 236, 239));
+            p.rect_stroke(Rect::from_min_size(c + v(-2.0, -2.0), v(9.0, 9.0)), 1.0, thin, StrokeKind::Middle);
+        }
+        RadialCmd::SameWidth => {
+            p.line_segment([c + v(-8.0, -7.0), c + v(-8.0, 7.0)], thin);
+            p.line_segment([c + v(8.0, -7.0), c + v(8.0, 7.0)], thin);
+            arrow2(c + v(-7.0, 0.0), c + v(7.0, 0.0));
+        }
+        RadialCmd::SameHeight => {
+            p.line_segment([c + v(-7.0, -8.0), c + v(7.0, -8.0)], thin);
+            p.line_segment([c + v(-7.0, 8.0), c + v(7.0, 8.0)], thin);
+            arrow2(c + v(0.0, -7.0), c + v(0.0, 7.0));
+        }
+        RadialCmd::Activity | RadialCmd::Responsible | RadialCmd::Remark => {
+            // a column divider with the column's letter on its side, and text lines below
+            let (x_line, letter_x, l) = match cmd {
+                RadialCmd::Activity => (2.0, -3.5, "A"),
+                RadialCmd::Responsible => (3.5, -2.5, "R"),
+                _ => (-4.5, 1.5, "R"),
+            };
+            p.line_segment([c + v(x_line, -9.0), c + v(x_line, 8.0)], thin);
+            p.line_segment([c + v(-9.0, -1.0), c + v(9.0, -1.0)], thin);
+            if cmd == RadialCmd::Responsible {
+                letter(c + v(-7.5, -5.0), "A", light, 8.5);
+            }
+            letter(c + v(letter_x, -5.5), l, red, 10.5);
+            for k in 0..3 {
+                let y = 2.5 + k as f32 * 2.6;
+                let (a, b) = if cmd == RadialCmd::Remark { (x_line + 2.0, 8.0) } else { (-8.0, x_line - 2.0) };
+                p.line_segment([c + v(a, y), c + v(b, y)], Stroke::new(1.0, light));
+            }
+            badge(on);
+        }
+        RadialCmd::Fit => {
+            for (k, w) in [(-3.5, 9.0), (0.0, 12.0), (3.5, 7.0)] {
+                p.line_segment([c + v(-w / 2.0, k), c + v(w / 2.0, k)], Stroke::new(1.4, light));
+            }
+            p.add(egui::Shape::convex_polygon(vec![c + v(-10.5, -3.0), c + v(-7.0, 0.0), c + v(-10.5, 3.0)], red, Stroke::NONE));
+            p.add(egui::Shape::convex_polygon(vec![c + v(10.5, -3.0), c + v(10.5, 3.0), c + v(7.0, 0.0)], red, Stroke::NONE));
+        }
+        RadialCmd::Calendar => {
+            let r = Rect::from_center_size(c + v(0.0, 1.0), v(17.0, 15.0));
+            p.rect_filled(r, 2.0, ink);
+            p.rect_filled(Rect::from_min_size(r.min, v(17.0, 3.5)), 2.0, fade(Color32::from_rgb(50, 52, 58)));
+            for x in [-4.5, 4.5] {
+                p.line_segment([c + v(x, -9.0), c + v(x, -5.0)], Stroke::new(1.6, ink));
+            }
+            for row in 0..3 {
+                for col in 0..4 {
+                    let dot = c + v(-5.4 + col as f32 * 3.6, -0.5 + row as f32 * 3.4);
+                    let col_ = if (row, col) == (1, 3) { red } else { Color32::WHITE };
+                    p.rect_filled(Rect::from_center_size(dot, v(2.0, 2.0)), 0.0, col_);
+                }
+            }
+        }
+        RadialCmd::AddBar => {
+            p.rect_filled(Rect::from_center_size(c + v(-1.5, -1.0), v(16.0, 6.0)), 1.0, blue);
+            badge(false);
+        }
+        RadialCmd::AddMilestone => {
+            let m = c + v(-1.5, -1.5);
+            let d = 6.5;
+            p.add(egui::Shape::convex_polygon(vec![m + v(0.0, -d), m + v(d, 0.0), m + v(0.0, d), m + v(-d, 0.0)], blue, Stroke::NONE));
+            badge(false);
+        }
+        RadialCmd::PasteHere => {
+            let r = Rect::from_center_size(c + v(0.0, 1.0), v(14.0, 17.0));
+            p.rect_stroke(r, 2.0, thin, StrokeKind::Middle);
+            p.rect_filled(Rect::from_center_size(Pos2::new(c.x, r.top()), v(7.0, 4.0)), 1.0, ink);
+            p.rect_filled(Rect::from_center_size(c + v(0.0, 2.0), v(9.0, 3.5)), 1.0, blue);
+        }
+        RadialCmd::Excel => {
+            let r = Rect::from_center_size(c, v(16.0, 16.0));
+            p.rect_filled(r, 2.0, green);
+            for k in 1..3 {
+                let x = r.left() + k as f32 * 16.0 / 3.0;
+                let y = r.top() + k as f32 * 16.0 / 3.0;
+                p.line_segment([Pos2::new(x, r.top()), Pos2::new(x, r.bottom())], Stroke::new(1.0, Color32::WHITE));
+                p.line_segment([Pos2::new(r.left(), y), Pos2::new(r.right(), y)], Stroke::new(1.0, Color32::WHITE));
+            }
+        }
+        RadialCmd::Datasheet => {
+            let r = Rect::from_center_size(c, v(18.0, 14.0));
+            p.rect_stroke(r, 1.0, thin, StrokeKind::Middle);
+            p.rect_filled(Rect::from_min_size(r.min, v(18.0, 4.0)), 1.0, light);
+            for k in 1..3 {
+                let x = r.left() + k as f32 * 6.0;
+                p.line_segment([Pos2::new(x, r.top()), Pos2::new(x, r.bottom())], Stroke::new(1.0, light));
+            }
+            p.line_segment([Pos2::new(r.left(), r.center().y + 2.0), Pos2::new(r.right(), r.center().y + 2.0)], Stroke::new(1.0, light));
+            if on {
+                badge(true);
+            }
+        }
+    }
+}
 
 fn annotation_row(ui: &mut egui::Ui, label: &str, id: &str, value: &mut Option<(usize, usize)>, cats: &[String], last: usize) {
     let mut on = value.is_some();
@@ -2662,5 +3579,70 @@ mod tests {
         t2.bars.push(Bar { start: 10.0, end: 10.0, milestone: true, dashed: false, color: 0 });
         let back: Task = serde_json::from_str(&serde_json::to_string(&t2).unwrap()).unwrap();
         assert_eq!(back, t2);
+    }
+
+    #[test]
+    fn copied_gantt_bar_pastes_on_top_and_can_be_moved() {
+        let mut g = Gantt::calendar(2026, 11, 2, 13);
+        // copy "Build" (row 3) through the clipboard text and paste it back
+        let clip = Clip::GanttItem { row: 3, bar: g.tasks[3].bars[0].clone() };
+        let Some(Clip::GanttItem { row, bar }) = Clip::from_text(&clip.to_text()) else { panic!("clipboard text didn't read back") };
+        assert_eq!(Clip::from_text("some text from Excel"), None);
+        let (r, b) = paste_bar(&mut g, row, bar, None);
+        assert_eq!((r, b), (3, 1));
+        assert_eq!(g.tasks[3].bars[1], g.tasks[3].bars[0]);
+        // the copy is on top, so it is the one grabbed there
+        let el = Element { id: 1, x: 40.0, y: 92.0, w: 880.0, h: 390.0, kind: Kind::Gantt(g.clone()) };
+        let xf = Xf { origin: Pos2::ZERO, scale: 1.0 };
+        let geo = draw::GanttGeo::new(xf.el_rect(&el), 1.0, &g);
+        assert_eq!(gantt_hit(&el, &xf, geo.bar_rect(&g.tasks[3].bars[1], 3).center()), Some(GanttHit::Bar(3, 1, BarPart::Move)));
+        // move it a week right and into "Test" below
+        let (r, b) = nudge_bar(&mut g, 3, 1, 1.0, 1);
+        assert_eq!((r, b), (4, 1));
+        assert_eq!((g.tasks[4].bars[1].start, g.tasks[4].bars[1].end), (5.0, 10.0));
+        assert_eq!(g.tasks[3].bars.len(), 1);
+        // pasting at a spot keeps the length and stays inside the timeline
+        let moved = g.tasks[4].bars[1].clone();
+        let (r, b) = paste_bar(&mut g, 0, moved, Some(12.0));
+        assert_eq!((g.tasks[r].bars[b].start, g.tasks[r].bars[b].end), (8.0, 13.0));
+        // a milestone stays a milestone
+        let kickoff = g.tasks[0].bars[0].clone();
+        let (r, b) = paste_bar(&mut g, 99, kickoff, Some(2.3));
+        assert_eq!(r, 5);
+        let m = &g.tasks[r].bars[b];
+        assert!(m.milestone && m.start == m.end && (m.start - 16.0 / 7.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn label_columns_fit_scale_and_calendar() {
+        let mut g = Gantt::calendar(2026, 11, 2, 13);
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(880.0, 390.0));
+        let plain = draw::GanttGeo::new(r, 1.0, &g);
+        // a responsible column goes left of the timeline, a remark column right of it
+        g.show_responsible = true;
+        g.show_remark = true;
+        g.tasks[3].responsible = "Ana".into();
+        g.tasks[3].remark = "On budget".into();
+        let both = draw::GanttGeo::new(r, 1.0, &g);
+        assert!(both.grid.left() > plain.grid.left() && both.grid.right() < plain.grid.right());
+        assert_eq!(both.grid.left(), both.activity_w + both.responsible_w);
+        // they are saved, and older files without them still open
+        let back: Gantt = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back, g);
+        let mut v: serde_json::Value = serde_json::to_value(&g).unwrap();
+        for k in ["show_activity", "show_responsible", "show_remark", "responsible_header", "remark_header"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: Gantt = serde_json::from_value(v).unwrap();
+        assert!(old.show_activity && !old.show_responsible && old.responsible_header == "Responsible");
+        // fit scale to data: bars run from week 0 to 11.5, so 12 weeks from the same Monday
+        assert!(g.fit_to_data());
+        assert_eq!((g.weeks, g.start), (12, Some([2026, 11, 2])));
+        // starting two weeks later keeps every date: "Build" (weeks 4..9) becomes 2..7
+        g.set_start_keep_dates(days_from_civil(2026, 11, 18));
+        assert_eq!(g.start, Some([2026, 11, 16]));
+        assert_eq!((g.tasks[3].bars[0].start, g.tasks[3].bars[0].end), (2.0, 7.0));
+        // the kick-off milestone fell before the start and is held at the first day
+        assert_eq!(g.tasks[0].bars[0].start, 0.0);
     }
 }
